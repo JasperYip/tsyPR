@@ -12,7 +12,7 @@ void StepperDriver::begin() {
   digitalWrite(cfg_.pin_step, LOW);
   digitalWrite(cfg_.pin_dir, LOW);
 
-  // Default disabled (safe)
+  // Default disabled
   if (cfg_.en_active_low) {
     digitalWrite(cfg_.pin_en, HIGH);
   } else {
@@ -25,20 +25,12 @@ void StepperDriver::begin() {
 }
 
 void StepperDriver::enable() {
-  if (cfg_.en_active_low) {
-    digitalWrite(cfg_.pin_en, LOW);
-  } else {
-    digitalWrite(cfg_.pin_en, HIGH);
-  }
+  digitalWrite(cfg_.pin_en, cfg_.en_active_low ? LOW : HIGH);
   enabled_ = true;
 }
 
 void StepperDriver::disable() {
-  if (cfg_.en_active_low) {
-    digitalWrite(cfg_.pin_en, HIGH);
-  } else {
-    digitalWrite(cfg_.pin_en, LOW);
-  }
+  digitalWrite(cfg_.pin_en, cfg_.en_active_low ? HIGH : LOW);
   enabled_ = false;
 }
 
@@ -47,25 +39,67 @@ void StepperDriver::setDirection(Direction dir) {
   digitalWrite(cfg_.pin_dir, (dir_ == Direction::CW) ? HIGH : LOW);
 }
 
-void StepperDriver::pulseStep_() const {
+void StepperDriver::pulseStep_(uint32_t interval_us) const {
+  const uint32_t pulse = static_cast<uint32_t>(cfg_.step_pulse_us);
+
   digitalWrite(cfg_.pin_step, HIGH);
-  delayMicroseconds(static_cast<uint32_t>(cfg_.step_pulse_us));
+  delayMicroseconds(pulse);
+
   digitalWrite(cfg_.pin_step, LOW);
+  delayMicroseconds(interval_us - pulse);
 }
 
 void StepperDriver::step() {
   if (!enabled_) return;
-  pulseStep_();
+
+  const uint32_t interval =
+      static_cast<uint32_t>(1e6f / steps_per_sec_);
+
+  pulseStep_(interval);
 }
 
 void StepperDriver::step(uint32_t steps) {
   if (!enabled_) return;
 
-  const float delay_us = 1e6f / steps_per_sec_;
+  const uint32_t interval =
+      static_cast<uint32_t>(1e6f / steps_per_sec_);
 
   for (uint32_t i = 0; i < steps; ++i) {
-    pulseStep_();
-    delayMicroseconds(static_cast<uint32_t>(delay_us));
+    pulseStep_(interval);
+  }
+}
+
+void StepperDriver::move(uint32_t steps) {
+  if (!enabled_) return;
+
+  const float min_speed = 50.0f;
+  const float max_speed = steps_per_sec_;
+
+  for (uint32_t i = 0; i < steps; ++i) {
+
+    float progress = (float)i / steps;
+
+    float speed;
+    if (progress < 0.2f) {
+      // accelerate
+      speed = min_speed +
+              (max_speed - min_speed) * (progress / 0.2f);
+    }
+    else if (progress > 0.8f) {
+      // decelerate
+      speed = min_speed +
+              (max_speed - min_speed) *
+              ((1.0f - progress) / 0.2f);
+    }
+    else {
+      // cruise
+      speed = max_speed;
+    }
+
+    const uint32_t interval =
+        static_cast<uint32_t>(1e6f / speed);
+
+    pulseStep_(interval);
   }
 }
 

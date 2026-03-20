@@ -32,10 +32,10 @@ constexpr uint8_t PIN_CAN_D = 1;   // connected to transceiver D (DI)
 // =====================
 // Roll Driver (DRV8825)
 // =====================
-constexpr uint8_t PIN_ROLL_DIR = 2;   // Roll motor direction
-constexpr uint8_t PIN_ROLL_STEP = 3;   // Roll motor step
-constexpr uint8_t PIN_ROLL_ENA = 4;   // Roll motor enable ()
-constexpr uint8_t PIN_ROLL_FLT  = 5;  // Roll motor fault
+constexpr uint8_t PIN_PITCH_DIR = 2;   // Roll motor direction
+constexpr uint8_t PIN_PITCH_STEP = 3;   // Roll motor step
+constexpr uint8_t PIN_PITCH_ENA = 4;   // Roll motor enable ()
+constexpr uint8_t PIN_PITCH_FLT  = 5;  // Roll motor fault
 
 // =====================
 // BMS UART (TinyBMS)
@@ -69,7 +69,7 @@ constexpr uint8_t PIN_LEAK = 18;
 // =====================
 // Pitch Driver (DRV8825)
 // =====================
-constexpr uint8_t PIN_PITCH_DIR = 20;   // Pitch motor direction
-constexpr uint8_t PIN_PITCH_STEP = 21;   // Pitch motor step
-constexpr uint8_t PIN_PITCH_ENA = 22;   // Pitch motor enable ()
-constexpr uint8_t PIN_PITCH_FLT  = 23;  // Pitch motor fault
+constexpr uint8_t PIN_ROLL_DIR = 20;   // Pitch motor direction
+constexpr uint8_t PIN_ROLL_STEP = 21;   // Pitch motor step
+constexpr uint8_t PIN_ROLL_ENA = 22;   // Pitch motor enable ()
+constexpr uint8_t PIN_ROLL_FLT  = 23;  // Pitch motor fault
