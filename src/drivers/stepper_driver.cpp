@@ -36,7 +36,7 @@ void StepperDriver::disable() {
 
 void StepperDriver::setDirection(Direction dir) {
   dir_ = dir;
-  digitalWrite(cfg_.pin_dir, (dir_ == Direction::CW) ? HIGH : LOW);
+  digitalWrite(cfg_.pin_dir, (dir_ == Direction::CCW) ? HIGH : LOW);
 }
 
 void StepperDriver::pulseStep_(uint32_t interval_us) const {
