@@ -1,0 +1,254 @@
+#include <Arduino.h>
+#include <cmath>
+#include <cstring>
+
+#include "config/constants.hpp"
+#include "config/pin_map.hpp"
+#include "controllers/bms_manager.hpp"
+#include "drivers/bms.hpp"
+
+// --------------------------------------------------
+// Test transport + manager
+// --------------------------------------------------
+static BmsUart bmsUart({
+    .serial = &Serial2,
+    .baud = BMS_BAUD
+});
+
+static BmsManager bms({
+    .transport = &bmsUart,
+    .poll_interval_ms = 20,
+    .response_timeout_ms = 40,
+    .max_retries = 0,
+    .fault_confirm_ms = 2000,
+    .timeout_small_ms = config::BMS_TIMEOUT_SMALL_MS,
+    .timeout_large_ms = config::BMS_TIMEOUT_LARGE_MS
+});
+
+static uint32_t g_now_ms = 0;
+
+// --------------------------------------------------
+// Assert helpers
+// --------------------------------------------------
+void check(bool cond, const char* msg)
+{
+    Serial.print(cond ? "[PASS] " : "[FAIL] ");
+    Serial.println(msg);
+}
+
+bool approx(float a, float b, float eps = 0.05f)
+{
+    return fabsf(a - b) <= eps;
+}
+
+// --------------------------------------------------
+// Time + manager step helpers
+// --------------------------------------------------
+void stepMs(uint32_t delta_ms)
+{
+    const uint32_t end = g_now_ms + delta_ms;
+    while (g_now_ms < end) {
+        g_now_ms += 10;
+        bms.update(g_now_ms);
+    }
+}
+
+void injectAndUpdate(const uint8_t* frame, uint16_t len)
+{
+    bmsUart.injectTestRx(frame, len);
+    bms.update(g_now_ms);
+}
+
+// --------------------------------------------------
+// TinyBMS frame builders (UART proprietary)
+// --------------------------------------------------
+uint16_t buildRespFloat(uint8_t cmd, float value, uint8_t* out)
+{
+    out[0] = 0xAA;
+    out[1] = cmd;
+    memcpy(&out[2], &value, sizeof(float)); // LE on Teensy
+
+    const uint16_t crc = BmsUart::crc16(out, 6);
+    out[6] = (uint8_t)(crc & 0xFFu);
+    out[7] = (uint8_t)((crc >> 8) & 0xFFu);
+    return 8;
+}
+
+uint16_t buildRespU16(uint8_t cmd, uint16_t value, uint8_t* out)
+{
+    out[0] = 0xAA;
+    out[1] = cmd;
+    out[2] = (uint8_t)(value & 0xFFu);
+    out[3] = (uint8_t)((value >> 8) & 0xFFu);
+
+    const uint16_t crc = BmsUart::crc16(out, 4);
+    out[4] = (uint8_t)(crc & 0xFFu);
+    out[5] = (uint8_t)((crc >> 8) & 0xFFu);
+    return 6;
+}
+
+uint16_t buildRespTemps(int16_t internal_dC, int16_t ext1_dC, int16_t ext2_dC, uint8_t* out)
+{
+    out[0] = 0xAA;
+    out[1] = 0x1B;
+    out[2] = 6; // payload bytes
+
+    out[3] = (uint8_t)(internal_dC & 0xFF);
+    out[4] = (uint8_t)((internal_dC >> 8) & 0xFF);
+    out[5] = (uint8_t)(ext1_dC & 0xFF);
+    out[6] = (uint8_t)((ext1_dC >> 8) & 0xFF);
+    out[7] = (uint8_t)(ext2_dC & 0xFF);
+    out[8] = (uint8_t)((ext2_dC >> 8) & 0xFF);
+
+    const uint16_t crc = BmsUart::crc16(out, 9);
+    out[9]  = (uint8_t)(crc & 0xFFu);
+    out[10] = (uint8_t)((crc >> 8) & 0xFFu);
+    return 11;
+}
+
+uint16_t buildRespNewestEvent(uint32_t bms_ts_s, uint32_t event_ts_s, uint8_t event_id, uint8_t* out)
+{
+    out[0] = 0xAA;
+    out[1] = 0x11;
+    out[2] = 8; // 4 bytes BTSP + 4 bytes one event entry
+
+    out[3] = (uint8_t)(bms_ts_s & 0xFFu);
+    out[4] = (uint8_t)((bms_ts_s >> 8) & 0xFFu);
+    out[5] = (uint8_t)((bms_ts_s >> 16) & 0xFFu);
+    out[6] = (uint8_t)((bms_ts_s >> 24) & 0xFFu);
+
+    out[7]  = (uint8_t)(event_ts_s & 0xFFu);
+    out[8]  = (uint8_t)((event_ts_s >> 8) & 0xFFu);
+    out[9]  = (uint8_t)((event_ts_s >> 16) & 0xFFu);
+    out[10] = event_id;
+
+    const uint16_t crc = BmsUart::crc16(out, 11);
+    out[11] = (uint8_t)(crc & 0xFFu);
+    out[12] = (uint8_t)((crc >> 8) & 0xFFu);
+    return 13;
+}
+
+void injectEvent(uint32_t bms_ts_s, uint32_t event_ts_s, uint8_t event_id)
+{
+    uint8_t f[16];
+    const uint16_t n = buildRespNewestEvent(bms_ts_s, event_ts_s, event_id, f);
+    injectAndUpdate(f, n);
+}
+
+// --------------------------------------------------
+// Tests
+// --------------------------------------------------
+void testTelemetryDecode()
+{
+    uint8_t f[16];
+
+    injectAndUpdate(f, buildRespFloat(0x14, 51.2f, f));  // pack voltage
+    injectAndUpdate(f, buildRespFloat(0x15, -8.5f, f));  // pack current
+    injectAndUpdate(f, buildRespU16(0x16, 4210, f));     // max cell mV
+    injectAndUpdate(f, buildRespU16(0x17, 3310, f));     // min cell mV
+    injectAndUpdate(f, buildRespU16(0x18, 0x0093, f));   // discharging
+    injectAndUpdate(f, buildRespTemps(278, -32768, -32768, f)); // 27.8C
+    injectEvent(1000, 990, 0x61);                        // info: system started
+
+    const auto& t = bms.telemetry();
+    check(approx(t.pack_voltage_v, 51.2f), "Telemetry: pack voltage decode");
+    check(approx(t.pack_current_a, -8.5f), "Telemetry: pack current decode");
+    check(t.max_cell_mv == 4210, "Telemetry: max cell decode");
+    check(t.min_cell_mv == 3310, "Telemetry: min cell decode");
+    check(t.online_status == 0x0093, "Telemetry: online status decode");
+    check(t.pack_temp_dC == 278, "Telemetry: internal temp 0.1C decode");
+    check(t.full_snapshot_ready, "Telemetry: full snapshot ready");
+}
+
+void testRecoverableFaults2sConfirm()
+{
+    // Overtemperature fault appears, then recovers before 2s -> should stay false
+    injectEvent(1010, 1001, 0x04);   // over-temp fault
+    stepMs(1500);
+    check(!bms.flags().bms_temp_high, "Overtemp not yet confirmed at 1.5s");
+
+    injectEvent(1012, 1002, 0x73);   // recovered over-temp
+    stepMs(700);
+    check(!bms.flags().bms_temp_high, "Overtemp clears before 2s confirm");
+
+    // Overtemperature fault persists past 2s -> should become true
+    injectEvent(1020, 1003, 0x04);
+    stepMs(2100);
+    check(bms.flags().bms_temp_high, "Overtemp confirmed after 2s");
+
+    injectEvent(1025, 1004, 0x73);
+    stepMs(50);
+    check(!bms.flags().bms_temp_high, "Overtemp clear event resets flag");
+
+    // Overcurrent confirm / recover
+    injectEvent(1030, 1005, 0x05);   // discharge over-current
+    stepMs(2100);
+    check(bms.flags().bms_overcurrent, "Overcurrent confirmed after 2s");
+
+    injectEvent(1035, 1006, 0x77);   // recovered discharge OC
+    stepMs(50);
+    check(!bms.flags().bms_overcurrent, "Overcurrent recovery clears flag");
+
+    // Low/high voltage confirm / recover
+    injectEvent(1040, 1007, 0x02);   // under-voltage
+    injectEvent(1040, 1008, 0x03);   // over-voltage
+    stepMs(2100);
+    check(bms.flags().bms_low_voltage, "Low-voltage confirmed after 2s");
+    check(bms.flags().bms_high_voltage, "High-voltage confirmed after 2s");
+
+    injectEvent(1045, 1009, 0x7B);   // recovered under-voltage
+    injectEvent(1045, 1010, 0x79);   // recovered over-voltage
+    stepMs(50);
+    check(!bms.flags().bms_low_voltage, "Low-voltage recovery clears flag");
+    check(!bms.flags().bms_high_voltage, "High-voltage recovery clears flag");
+}
+
+void testSwitchFaultImmediate()
+{
+    injectEvent(1050, 1011, 0x0B); // charger switch error
+    check(bms.flags().bms_switch_fault, "Switch fault immediate on event");
+}
+
+void testTimeoutFlags()
+{
+    // Ensure we have a recent good RX timestamp first
+    injectEvent(1060, 1012, 0x61);
+
+    stepMs(config::BMS_TIMEOUT_SMALL_MS - 100);
+    check(!bms.flags().bms_timeout_small, "Timeout small not yet active");
+
+    stepMs(200);
+    check(bms.flags().bms_timeout_small, "Timeout small active");
+    check(!bms.flags().bms_timeout_large, "Timeout large not yet active");
+
+    stepMs(config::BMS_TIMEOUT_LARGE_MS - config::BMS_TIMEOUT_SMALL_MS + 100);
+    check(bms.flags().bms_timeout_large, "Timeout large active");
+}
+
+void runAllTests()
+{
+    Serial.println("\n=== BMS MANAGER VIRTUAL TESTS ===\n");
+
+    testTelemetryDecode();
+    testRecoverableFaults2sConfirm();
+    testSwitchFaultImmediate();
+    testTimeoutFlags();
+
+    Serial.println("\n=== BMS MANAGER TESTS COMPLETE ===\n");
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(1500);
+
+    // Note: no physical TinyBMS needed for these tests.
+    bms.begin(g_now_ms);
+
+    runAllTests();
+}
+
+void loop()
+{
+}
+
