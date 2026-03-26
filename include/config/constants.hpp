@@ -34,6 +34,9 @@ constexpr uint8_t NODE_ID_LEFT  = 3;
 constexpr float PITCH_STEP_MM = 0.01f;
 constexpr float ROLL_STEP_DEG = 0.045f;
 
+constexpr float PITCH_MAX_MM = 56.9f;
+constexpr float ROLL_MAX_DEG = 90.0f;
+
 /* ----------------------------------------------------------
    SAFETY PLACEHOLDERS
 ---------------------------------------------------------- */
