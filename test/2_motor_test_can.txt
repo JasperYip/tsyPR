@@ -1,0 +1,937 @@
+#include <Arduino.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "config/constants.hpp"
+#include "config/pin_map.hpp"
+#include "drivers/can_bus.hpp"
+#include "drivers/hall_sensor.hpp"
+#include "drivers/push_switch.hpp"
+#include "drivers/stepper_driver.hpp"
+#include "protocols/can_messages.hpp"
+
+// Paste this into src/main.cpp to run a 2-motor test with CAN mode.
+// Modes:
+// - MANUAL: direct serial jogs
+// - AUTO: serial absolute setpoints
+// - CAN:  absolute setpoints from CMD_SETPOINT frame
+
+enum class ControlMode : uint8_t {
+    MANUAL = 0,
+    AUTO = 1,
+    CAN = 2
+};
+
+static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CW;
+static constexpr StepperDriver::Direction ROLL_CW_DIR = StepperDriver::Direction::CW;
+
+static constexpr float PITCH_HOME_SPEED_STEPS_S = 700.0f;
+static constexpr float ROLL_HOME_SPEED_STEPS_S = 700.0f;
+static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
+static constexpr uint32_t ROLL_HOME_MAX_STEPS = 15000;
+
+static constexpr uint32_t CAN_BITRATE = 500000;
+static constexpr uint32_t CAN_STATUS_TX_INTERVAL_MS = 50;
+static constexpr uint8_t CAN_NODE_ID = NODE_ID;
+
+StepperDriver pitch({
+    .pin_step = PIN_PITCH_STEP,
+    .pin_dir = PIN_PITCH_DIR,
+    .pin_en = PIN_PITCH_ENA,
+    .pin_flt = PIN_PITCH_FLT,
+    .step_pulse_us = 5.0f,
+    .steps_per_sec = 1200.0f,
+    .flt_active_low = true,
+    .en_active_low = true
+});
+
+StepperDriver roll({
+    .pin_step = PIN_ROLL_STEP,
+    .pin_dir = PIN_ROLL_DIR,
+    .pin_en = PIN_ROLL_ENA,
+    .pin_flt = PIN_ROLL_FLT,
+    .step_pulse_us = 5.0f,
+    .steps_per_sec = 1200.0f,
+    .flt_active_low = true,
+    .en_active_low = true
+});
+
+PushSwitch pitchFwdLimit({ .pin = PIN_FWD_SWH, .active_low = true, .use_pullup = true });
+PushSwitch pitchRevLimit({ .pin = PIN_BWD_SWH, .active_low = true, .use_pullup = true });
+HallSensor rollHall({ .pin = PIN_HALL_SENS, .active_low = true, .use_pullup = true });
+
+CanBus canBus;
+
+ControlMode mode = ControlMode::MANUAL;
+StepperDriver::Direction pitchDir = PITCH_FORWARD_DIR;
+StepperDriver::Direction rollDir = ROLL_CW_DIR;
+
+bool motorsEnabled = true;
+bool pitchHomed = false;
+bool rollHomed = false;
+
+int32_t pitchSteps = 0;
+int32_t rollSteps = 0;
+
+bool movedPitchSinceTx = false;
+bool movedRollSinceTx = false;
+
+String rx;
+
+uint8_t canSequence = 0;
+uint32_t lastCanStatusTxMs = 0;
+uint32_t lastCanRxMs = 0;
+uint32_t canRxCount = 0;
+bool lastCanStartHomingBit = false;
+
+const char* modeName(ControlMode m) {
+    switch (m) {
+    case ControlMode::MANUAL: return "MANUAL";
+    case ControlMode::AUTO:   return "AUTO";
+    case ControlMode::CAN:    return "CAN";
+    default:                  return "?";
+    }
+}
+
+float clampf(float v, float minV, float maxV) {
+    if (v < minV) return minV;
+    if (v > maxV) return maxV;
+    return v;
+}
+
+bool parseFloatStrict(const String& text, float& outValue) {
+    String token = text;
+    token.trim();
+    if (token.length() == 0) {
+        return false;
+    }
+
+    const char* begin = token.c_str();
+    char* end = nullptr;
+    outValue = strtof(begin, &end);
+    if (end == begin) {
+        return false;
+    }
+
+    while (*end == ' ' || *end == '\t') {
+        ++end;
+    }
+
+    return (*end == '\0') && isfinite(outValue);
+}
+
+int16_t clampInt16(int32_t v) {
+    if (v < -32768) return -32768;
+    if (v > 32767) return 32767;
+    return static_cast<int16_t>(v);
+}
+
+int32_t pitchMmToSteps(float mm) {
+    return static_cast<int32_t>(lroundf(mm / config::PITCH_STEP_MM));
+}
+
+int32_t rollDegToSteps(float deg) {
+    return static_cast<int32_t>(lroundf(deg / config::ROLL_STEP_DEG));
+}
+
+float pitchStepsToMm(int32_t steps) {
+    return static_cast<float>(steps) * config::PITCH_STEP_MM;
+}
+
+float rollStepsToDeg(int32_t steps) {
+    return static_cast<float>(steps) * config::ROLL_STEP_DEG;
+}
+
+uint32_t absStepsI32(int32_t v) {
+    return (v >= 0) ? static_cast<uint32_t>(v) : static_cast<uint32_t>(-v);
+}
+
+StepperDriver::Direction opposite(StepperDriver::Direction d) {
+    return (d == StepperDriver::Direction::CW)
+        ? StepperDriver::Direction::CCW
+        : StepperDriver::Direction::CW;
+}
+
+bool homePitch();
+bool homeRoll();
+void movePitchToMmCore(float targetMm, const char* source);
+void moveRollToDegCore(float targetDeg, const char* source);
+void handleCanRx();
+void sendCanStatusControl();
+
+void printHelp() {
+    Serial.println();
+    Serial.println("=== 2 MOTOR TEST WITH CAN MODE ===");
+    Serial.println("help         : print commands");
+    Serial.println("status       : show current status");
+    Serial.println("manual       : MANUAL mode");
+    Serial.println("auto on/off  : enable/disable AUTO mode");
+    Serial.println("can on/off   : enable/disable CAN mode");
+    Serial.println("homep        : pitch homing");
+    Serial.println("homer        : roll homing");
+    Serial.println("home         : pitch + roll homing");
+    Serial.println("en / dis     : enable / disable both drivers");
+    Serial.println("zero         : clear software counters and homed flags");
+    Serial.println();
+    Serial.println("MANUAL-only commands:");
+    Serial.println("pf / pb      : pitch direction forward/backward");
+    Serial.println("pm <mm>      : move pitch by mm in selected direction");
+    Serial.println("ps <steps>   : move pitch by steps in selected direction");
+    Serial.println("rcw / rccw   : roll direction CW/CCW");
+    Serial.println("rm <deg>     : move roll by deg in selected direction");
+    Serial.println("rs <steps>   : move roll by steps in selected direction");
+    Serial.println();
+    Serial.println("AUTO-only absolute commands:");
+    Serial.println("ap <mm>      : absolute pitch target");
+    Serial.println("ar <deg>     : absolute roll target");
+    Serial.println("goto <mm> <deg> : absolute pitch + roll");
+    Serial.println();
+    Serial.print("CAN CMD ID = 0x");
+    Serial.println((can::CMD_SETPOINT_BASE + CAN_NODE_ID), HEX);
+    Serial.print("CAN STATUS_CONTROL TX ID = 0x");
+    Serial.println((can::STATUS_CONTROL_BASE + CAN_NODE_ID), HEX);
+    Serial.println();
+}
+
+void printStatus() {
+    Serial.println();
+    Serial.print("mode=");
+    Serial.print(modeName(mode));
+    Serial.print("  motors=");
+    Serial.println(motorsEnabled ? "EN" : "DIS");
+
+    Serial.print("homed_pitch=");
+    Serial.print(pitchHomed ? "YES" : "NO");
+    Serial.print("  homed_roll=");
+    Serial.println(rollHomed ? "YES" : "NO");
+
+    Serial.print("pitch_dir=");
+    Serial.print((pitchDir == PITCH_FORWARD_DIR) ? "FWD" : "BWD");
+    Serial.print("  pitch_mm=");
+    Serial.print(pitchStepsToMm(pitchSteps), 3);
+    Serial.print("  pitch_steps=");
+    Serial.print(pitchSteps);
+    Serial.print("  pitch_fault=");
+    Serial.print(pitch.faultActive() ? "YES" : "NO");
+    Serial.print("  lim_fwd=");
+    Serial.print(pitchFwdLimit.isPressed() ? "PRESSED" : "OPEN");
+    Serial.print("  lim_rev=");
+    Serial.println(pitchRevLimit.isPressed() ? "PRESSED" : "OPEN");
+
+    Serial.print("roll_dir=");
+    Serial.print((rollDir == ROLL_CW_DIR) ? "CW" : "CCW");
+    Serial.print("  roll_deg=");
+    Serial.print(rollStepsToDeg(rollSteps), 3);
+    Serial.print("  roll_steps=");
+    Serial.print(rollSteps);
+    Serial.print("  roll_fault=");
+    Serial.print(roll.faultActive() ? "YES" : "NO");
+    Serial.print("  hall=");
+    Serial.println(rollHall.isActive() ? "ACTIVE" : "INACTIVE");
+
+    Serial.print("can_rx_count=");
+    Serial.print(canRxCount);
+    Serial.print("  last_can_rx_ms_ago=");
+    if (lastCanRxMs == 0) {
+        Serial.println("N/A");
+    } else {
+        Serial.println(millis() - lastCanRxMs);
+    }
+}
+
+void setMotorsEnabled(bool en) {
+    motorsEnabled = en;
+    if (en) {
+        pitch.enable();
+        roll.enable();
+    } else {
+        pitch.disable();
+        roll.disable();
+    }
+}
+
+void movePitchSteps(uint32_t steps) {
+    if (!motorsEnabled) {
+        Serial.println("Pitch move blocked: drivers are disabled");
+        return;
+    }
+    if (steps == 0) {
+        return;
+    }
+    pitch.move(steps);
+    pitchSteps += (pitchDir == PITCH_FORWARD_DIR)
+        ? static_cast<int32_t>(steps)
+        : -static_cast<int32_t>(steps);
+    movedPitchSinceTx = true;
+}
+
+void moveRollSteps(uint32_t steps) {
+    if (!motorsEnabled) {
+        Serial.println("Roll move blocked: drivers are disabled");
+        return;
+    }
+    if (steps == 0) {
+        return;
+    }
+    roll.move(steps);
+    rollSteps += (rollDir == ROLL_CW_DIR)
+        ? static_cast<int32_t>(steps)
+        : -static_cast<int32_t>(steps);
+    movedRollSinceTx = true;
+}
+
+void movePitchToMmCore(float targetMm, const char* source) {
+    if (!motorsEnabled) {
+        Serial.println("Pitch absolute move blocked: drivers are disabled");
+        return;
+    }
+    if (!pitchHomed) {
+        Serial.println("Pitch absolute move blocked: pitch not homed");
+        return;
+    }
+
+    const float clampedMm = clampf(targetMm, config::PITCH_MIN_MM, config::PITCH_MAX_MM);
+    if (clampedMm != targetMm) {
+        Serial.print(source);
+        Serial.print(": pitch target clamped to ");
+        Serial.print(clampedMm, 3);
+        Serial.println(" mm");
+    }
+
+    const int32_t targetSteps = pitchMmToSteps(clampedMm);
+    const int32_t delta = targetSteps - pitchSteps;
+    if (delta == 0) {
+        return;
+    }
+
+    pitchDir = (delta > 0) ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR);
+    pitch.setDirection(pitchDir);
+    movePitchSteps(absStepsI32(delta));
+    pitchSteps = targetSteps;
+}
+
+void moveRollToDegCore(float targetDeg, const char* source) {
+    if (!motorsEnabled) {
+        Serial.println("Roll absolute move blocked: drivers are disabled");
+        return;
+    }
+    if (!rollHomed) {
+        Serial.println("Roll absolute move blocked: roll not homed");
+        return;
+    }
+
+    const float clampedDeg = clampf(targetDeg, config::ROLL_MIN_DEG, config::ROLL_MAX_DEG);
+    if (clampedDeg != targetDeg) {
+        Serial.print(source);
+        Serial.print(": roll target clamped to ");
+        Serial.print(clampedDeg, 3);
+        Serial.println(" deg");
+    }
+
+    const int32_t targetSteps = rollDegToSteps(clampedDeg);
+    const int32_t delta = targetSteps - rollSteps;
+    if (delta == 0) {
+        return;
+    }
+
+    rollDir = (delta > 0) ? ROLL_CW_DIR : opposite(ROLL_CW_DIR);
+    roll.setDirection(rollDir);
+    moveRollSteps(absStepsI32(delta));
+    rollSteps = targetSteps;
+}
+
+bool homePitch() {
+    if (!motorsEnabled) {
+        Serial.println("Pitch homing blocked: drivers are disabled");
+        return false;
+    }
+
+    Serial.println("Pitch homing start...");
+    bool ok = false;
+    pitchHomed = false;
+
+    const float savedSpeed = pitch.speed();
+    pitch.setSpeed(PITCH_HOME_SPEED_STEPS_S);
+
+    do {
+        pitchDir = PITCH_FORWARD_DIR;
+        pitch.setDirection(pitchDir);
+
+        uint32_t moved = 0;
+        while (!pitchFwdLimit.isPressed() && moved < PITCH_HOME_MAX_STEPS) {
+            pitch.step();
+            pitchSteps++;
+            moved++;
+            if (pitch.faultActive()) {
+                Serial.println("Pitch homing abort: driver fault seeking FWD switch");
+                break;
+            }
+        }
+        if (!pitchFwdLimit.isPressed()) {
+            Serial.println("Pitch homing failed: FWD limit not reached");
+            break;
+        }
+        const int32_t fwdHit = pitchSteps;
+
+        pitchDir = opposite(PITCH_FORWARD_DIR);
+        pitch.setDirection(pitchDir);
+        moved = 0;
+        while (!pitchRevLimit.isPressed() && moved < PITCH_HOME_MAX_STEPS) {
+            pitch.step();
+            pitchSteps--;
+            moved++;
+            if (pitch.faultActive()) {
+                Serial.println("Pitch homing abort: driver fault seeking REV switch");
+                break;
+            }
+        }
+        if (!pitchRevLimit.isPressed()) {
+            Serial.println("Pitch homing failed: REV limit not reached");
+            break;
+        }
+        const int32_t revHit = pitchSteps;
+
+        const int32_t span = fwdHit - revHit;
+        if (span <= 0) {
+            Serial.println("Pitch homing failed: invalid switch span");
+            break;
+        }
+
+        const int32_t center = revHit + (span / 2);
+        const int32_t delta = center - pitchSteps;
+        if (delta != 0) {
+            const bool toForward = (delta > 0);
+            pitchDir = toForward ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR);
+            pitch.setDirection(pitchDir);
+
+            const uint32_t steps = absStepsI32(delta);
+            for (uint32_t i = 0; i < steps; i++) {
+                pitch.step();
+                pitchSteps += toForward ? 1 : -1;
+                if (pitch.faultActive()) {
+                    Serial.println("Pitch homing abort: driver fault while centering");
+                    break;
+                }
+            }
+            if (pitch.faultActive()) {
+                break;
+            }
+        }
+
+        pitchSteps = 0;
+        pitchDir = PITCH_FORWARD_DIR;
+        pitch.setDirection(pitchDir);
+        pitchHomed = true;
+        ok = true;
+    } while (false);
+
+    pitch.setSpeed(savedSpeed);
+
+    if (ok) {
+        Serial.println("Pitch homing success");
+    } else {
+        Serial.println("Pitch homing failure");
+    }
+    return ok;
+}
+
+bool homeRoll() {
+    if (!motorsEnabled) {
+        Serial.println("Roll homing blocked: drivers are disabled");
+        return false;
+    }
+
+    Serial.println("Roll homing start...");
+    bool ok = false;
+    rollHomed = false;
+
+    const float savedSpeed = roll.speed();
+    roll.setSpeed(ROLL_HOME_SPEED_STEPS_S);
+
+    do {
+        uint32_t moved = 0;
+
+        rollDir = ROLL_CW_DIR;
+        roll.setDirection(rollDir);
+        while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            roll.step();
+            rollSteps++;
+            moved++;
+            if (roll.faultActive()) {
+                Serial.println("Roll homing abort: driver fault clearing hall");
+                break;
+            }
+        }
+        if (rollHall.isActive()) {
+            Serial.println("Roll homing failed: hall stayed active in CW phase");
+            break;
+        }
+
+        rollDir = opposite(ROLL_CW_DIR);
+        roll.setDirection(rollDir);
+        moved = 0;
+        while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            roll.step();
+            rollSteps--;
+            moved++;
+            if (roll.faultActive()) {
+                Serial.println("Roll homing abort: driver fault seeking hall enter");
+                break;
+            }
+        }
+        if (!rollHall.isActive()) {
+            Serial.println("Roll homing failed: hall enter edge not found");
+            break;
+        }
+        const int32_t hallEnter = rollSteps;
+
+        moved = 0;
+        while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            roll.step();
+            rollSteps--;
+            moved++;
+            if (roll.faultActive()) {
+                Serial.println("Roll homing abort: driver fault seeking hall exit");
+                break;
+            }
+        }
+        if (rollHall.isActive()) {
+            Serial.println("Roll homing failed: hall exit edge not found");
+            break;
+        }
+        const int32_t hallExit = rollSteps;
+
+        const int32_t band = hallEnter - hallExit;
+        if (band <= 0) {
+            Serial.println("Roll homing failed: invalid hall band");
+            break;
+        }
+
+        const int32_t center = hallExit + (band / 2);
+        const int32_t delta = center - rollSteps;
+        if (delta != 0) {
+            const bool toCW = (delta > 0);
+            rollDir = toCW ? ROLL_CW_DIR : opposite(ROLL_CW_DIR);
+            roll.setDirection(rollDir);
+
+            const uint32_t steps = absStepsI32(delta);
+            for (uint32_t i = 0; i < steps; i++) {
+                roll.step();
+                rollSteps += toCW ? 1 : -1;
+                if (roll.faultActive()) {
+                    Serial.println("Roll homing abort: driver fault while centering");
+                    break;
+                }
+            }
+            if (roll.faultActive()) {
+                break;
+            }
+        }
+
+        rollSteps = 0;
+        rollDir = ROLL_CW_DIR;
+        roll.setDirection(rollDir);
+        rollHomed = true;
+        ok = true;
+    } while (false);
+
+    roll.setSpeed(savedSpeed);
+
+    if (ok) {
+        Serial.println("Roll homing success");
+    } else {
+        Serial.println("Roll homing failure");
+    }
+    return ok;
+}
+
+void handleCanRx() {
+    CanFrame frame;
+    while (canBus.read(frame)) {
+        const uint16_t id = static_cast<uint16_t>(frame.id & 0x7FFu);
+        const uint16_t cmdId = static_cast<uint16_t>(can::CMD_SETPOINT_BASE + CAN_NODE_ID);
+        if (id != cmdId) {
+            continue;
+        }
+
+        if (frame.len < 8) {
+            continue;
+        }
+
+        can::CmdSetpoint cmd{};
+        can::unpackCmdSetpoint(frame.data, cmd);
+
+        canRxCount++;
+        lastCanRxMs = millis();
+
+        const bool cmdMotorEnable = (cmd.command_mode & can::CMD_MOTOR_ENABLE) != 0;
+        const bool cmdStartHoming = (cmd.command_mode & can::CMD_START_HOMING) != 0;
+        const bool startHomingRise = cmdStartHoming && !lastCanStartHomingBit;
+        lastCanStartHomingBit = cmdStartHoming;
+
+        if (startHomingRise) {
+            const bool pOk = homePitch();
+            const bool rOk = homeRoll();
+            Serial.print("CAN homing result: pitch=");
+            Serial.print(pOk ? "OK" : "FAIL");
+            Serial.print(" roll=");
+            Serial.println(rOk ? "OK" : "FAIL");
+        }
+
+        if (cmdMotorEnable && !motorsEnabled) {
+            setMotorsEnabled(true);
+            Serial.println("CAN: motor enable ON");
+        } else if (!cmdMotorEnable && motorsEnabled) {
+            setMotorsEnabled(false);
+            Serial.println("CAN: motor enable OFF");
+        }
+
+        if (mode != ControlMode::CAN) {
+            continue;
+        }
+        if (!motorsEnabled || !pitchHomed || !rollHomed) {
+            continue;
+        }
+
+        const float pitchTargetMm = static_cast<float>(cmd.pitch_travel_01mm) / 10.0f;
+        const float rollTargetDeg = static_cast<float>(cmd.roll_angle_01deg) / 10.0f;
+
+        movePitchToMmCore(pitchTargetMm, "CAN");
+        moveRollToDegCore(rollTargetDeg, "CAN");
+    }
+}
+
+void sendCanStatusControl() {
+    can::StatusControl msg{};
+    msg.pitch_pos_01mm = clampInt16(static_cast<int32_t>(lroundf(pitchStepsToMm(pitchSteps) * 10.0f)));
+    msg.roll_angle_01deg = clampInt16(static_cast<int32_t>(lroundf(rollStepsToDeg(rollSteps) * 10.0f)));
+
+    uint8_t flagsA = 0;
+    if (pitchDir == PITCH_FORWARD_DIR) flagsA |= can::FLAG_DIR_P;
+    if (rollDir == ROLL_CW_DIR) flagsA |= can::FLAG_DIR_R;
+    if (pitchHomed) flagsA |= can::FLAG_HOMED_P;
+    if (rollHomed) flagsA |= can::FLAG_HOMED_R;
+    if (movedPitchSinceTx) flagsA |= can::FLAG_MOVING_P;
+    if (movedRollSinceTx) flagsA |= can::FLAG_MOVING_R;
+    if (motorsEnabled) {
+        flagsA |= can::FLAG_ENABLE_P;
+        flagsA |= can::FLAG_ENABLE_R;
+    }
+    msg.flagsA = flagsA;
+
+    uint8_t flagsB = 0;
+    if (pitchFwdLimit.isPressed()) flagsB |= can::FLAG_LIM_F;
+    if (pitchRevLimit.isPressed()) flagsB |= can::FLAG_LIM_R;
+    if (rollHall.isActive()) flagsB |= can::FLAG_HALL;
+    msg.flagsB = flagsB;
+
+    msg.sequence = canSequence++;
+    msg.tof_mm = 0;
+
+    uint8_t buf[8] = {0};
+    can::packStatusControl(buf, msg);
+
+    CanFrame frame{};
+    frame.id = static_cast<uint32_t>(can::STATUS_CONTROL_BASE + CAN_NODE_ID);
+    frame.len = 8;
+    memcpy(frame.data, buf, 8);
+    canBus.write(frame);
+
+    movedPitchSinceTx = false;
+    movedRollSinceTx = false;
+}
+
+void handleCommand(String cmd) {
+    cmd.trim();
+    cmd.toLowerCase();
+    if (cmd.length() == 0) return;
+
+    if (cmd == "help") {
+        printHelp();
+        return;
+    }
+    if (cmd == "status") {
+        printStatus();
+        return;
+    }
+    if (cmd == "manual") {
+        mode = ControlMode::MANUAL;
+        Serial.println("Mode -> MANUAL");
+        return;
+    }
+    if (cmd == "auto on") {
+        if (!pitchHomed || !rollHomed) {
+            Serial.println("AUTO blocked: home both axes first");
+            return;
+        }
+        mode = ControlMode::AUTO;
+        Serial.println("Mode -> AUTO");
+        return;
+    }
+    if (cmd == "auto off") {
+        if (mode == ControlMode::AUTO) {
+            mode = ControlMode::MANUAL;
+        }
+        Serial.println("AUTO disabled");
+        return;
+    }
+    if (cmd == "can on") {
+        if (!pitchHomed || !rollHomed) {
+            Serial.println("CAN mode blocked: home both axes first");
+            return;
+        }
+        mode = ControlMode::CAN;
+        Serial.println("Mode -> CAN");
+        return;
+    }
+    if (cmd == "can off") {
+        if (mode == ControlMode::CAN) {
+            mode = ControlMode::MANUAL;
+        }
+        Serial.println("CAN mode disabled");
+        return;
+    }
+    if (cmd == "en") {
+        setMotorsEnabled(true);
+        Serial.println("Drivers enabled");
+        return;
+    }
+    if (cmd == "dis") {
+        setMotorsEnabled(false);
+        Serial.println("Drivers disabled");
+        return;
+    }
+    if (cmd == "zero") {
+        pitchSteps = 0;
+        rollSteps = 0;
+        pitchHomed = false;
+        rollHomed = false;
+        if (mode != ControlMode::MANUAL) mode = ControlMode::MANUAL;
+        Serial.println("Software counters reset; homed flags cleared");
+        return;
+    }
+    if (cmd == "homep") {
+        if (mode != ControlMode::MANUAL) mode = ControlMode::MANUAL;
+        homePitch();
+        printStatus();
+        return;
+    }
+    if (cmd == "homer") {
+        if (mode != ControlMode::MANUAL) mode = ControlMode::MANUAL;
+        homeRoll();
+        printStatus();
+        return;
+    }
+    if (cmd == "home") {
+        if (mode != ControlMode::MANUAL) mode = ControlMode::MANUAL;
+        const bool p = homePitch();
+        const bool r = homeRoll();
+        Serial.print("Home summary: pitch=");
+        Serial.print(p ? "OK" : "FAIL");
+        Serial.print(" roll=");
+        Serial.println(r ? "OK" : "FAIL");
+        printStatus();
+        return;
+    }
+
+    // MANUAL-only
+    if (cmd == "pf" || cmd == "pb" || cmd == "rcw" || cmd == "rccw" ||
+        cmd.startsWith("pm") || cmd.startsWith("ps") ||
+        cmd.startsWith("rm") || cmd.startsWith("rs")) {
+
+        if (mode != ControlMode::MANUAL) {
+            Serial.println("Manual command blocked: switch to MANUAL mode");
+            return;
+        }
+
+        if (cmd == "pf") {
+            pitchDir = PITCH_FORWARD_DIR;
+            pitch.setDirection(pitchDir);
+            Serial.println("Pitch direction -> FORWARD");
+            return;
+        }
+        if (cmd == "pb") {
+            pitchDir = opposite(PITCH_FORWARD_DIR);
+            pitch.setDirection(pitchDir);
+            Serial.println("Pitch direction -> BACKWARD");
+            return;
+        }
+        if (cmd == "rcw") {
+            rollDir = ROLL_CW_DIR;
+            roll.setDirection(rollDir);
+            Serial.println("Roll direction -> CW");
+            return;
+        }
+        if (cmd == "rccw") {
+            rollDir = opposite(ROLL_CW_DIR);
+            roll.setDirection(rollDir);
+            Serial.println("Roll direction -> CCW");
+            return;
+        }
+        if (cmd.startsWith("pm")) {
+            String arg = cmd.substring(2);
+            float mm = 0.0f;
+            if (!parseFloatStrict(arg, mm) || mm <= 0.0f) {
+                Serial.println("Invalid pitch mm. Example: pm 5");
+                return;
+            }
+            const int32_t steps = pitchMmToSteps(mm);
+            if (steps <= 0) {
+                Serial.println("Pitch move too small after conversion");
+                return;
+            }
+            movePitchSteps(static_cast<uint32_t>(steps));
+            printStatus();
+            return;
+        }
+        if (cmd.startsWith("ps")) {
+            String arg = cmd.substring(2);
+            arg.trim();
+            const long steps = arg.toInt();
+            if (steps <= 0) {
+                Serial.println("Invalid pitch steps. Example: ps 200");
+                return;
+            }
+            movePitchSteps(static_cast<uint32_t>(steps));
+            printStatus();
+            return;
+        }
+        if (cmd.startsWith("rm")) {
+            String arg = cmd.substring(2);
+            float deg = 0.0f;
+            if (!parseFloatStrict(arg, deg) || deg <= 0.0f) {
+                Serial.println("Invalid roll deg. Example: rm 5");
+                return;
+            }
+            const int32_t steps = rollDegToSteps(deg);
+            if (steps <= 0) {
+                Serial.println("Roll move too small after conversion");
+                return;
+            }
+            moveRollSteps(static_cast<uint32_t>(steps));
+            printStatus();
+            return;
+        }
+        if (cmd.startsWith("rs")) {
+            String arg = cmd.substring(2);
+            arg.trim();
+            const long steps = arg.toInt();
+            if (steps <= 0) {
+                Serial.println("Invalid roll steps. Example: rs 200");
+                return;
+            }
+            moveRollSteps(static_cast<uint32_t>(steps));
+            printStatus();
+            return;
+        }
+    }
+
+    // AUTO-only absolute commands
+    if (cmd.startsWith("ap") || cmd.startsWith("ar") || cmd.startsWith("goto")) {
+        if (mode != ControlMode::AUTO) {
+            Serial.println("Absolute command blocked: switch to AUTO mode");
+            return;
+        }
+
+        if (cmd.startsWith("ap")) {
+            String arg = cmd.substring(2);
+            float mm = 0.0f;
+            if (!parseFloatStrict(arg, mm)) {
+                Serial.println("Invalid pitch absolute target. Example: ap 12.5");
+                return;
+            }
+            movePitchToMmCore(mm, "AUTO");
+            printStatus();
+            return;
+        }
+        if (cmd.startsWith("ar")) {
+            String arg = cmd.substring(2);
+            float deg = 0.0f;
+            if (!parseFloatStrict(arg, deg)) {
+                Serial.println("Invalid roll absolute target. Example: ar -6.0");
+                return;
+            }
+            moveRollToDegCore(deg, "AUTO");
+            printStatus();
+            return;
+        }
+        if (cmd.startsWith("goto")) {
+            String args = cmd.substring(4);
+            args.trim();
+            const int sep = args.indexOf(' ');
+            if (sep < 0) {
+                Serial.println("Invalid goto format. Example: goto 12.5 -6.0");
+                return;
+            }
+            String pStr = args.substring(0, sep);
+            String rStr = args.substring(sep + 1);
+            pStr.trim();
+            rStr.trim();
+            if (pStr.length() == 0 || rStr.length() == 0) {
+                Serial.println("Invalid goto format. Example: goto 12.5 -6.0");
+                return;
+            }
+
+            float pMm = 0.0f;
+            float rDeg = 0.0f;
+            if (!parseFloatStrict(pStr, pMm) || !parseFloatStrict(rStr, rDeg)) {
+                Serial.println("Invalid goto values. Example: goto 12.5 -6.0");
+                return;
+            }
+            movePitchToMmCore(pMm, "AUTO");
+            moveRollToDegCore(rDeg, "AUTO");
+            printStatus();
+            return;
+        }
+    }
+
+    Serial.println("Unknown command. Type: help");
+}
+
+void readSerial() {
+    while (Serial.available()) {
+        const char c = static_cast<char>(Serial.read());
+        if (c == '\r' || c == '\n') {
+            if (rx.length() > 0) {
+                handleCommand(rx);
+                rx = "";
+            }
+        } else {
+            rx += c;
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(1500);
+
+    pitch.begin();
+    roll.begin();
+    pitchFwdLimit.begin();
+    pitchRevLimit.begin();
+    rollHall.begin();
+
+    pitch.setSpeed(1200.0f);
+    roll.setSpeed(1200.0f);
+    pitch.setDirection(pitchDir);
+    roll.setDirection(rollDir);
+    setMotorsEnabled(true);
+
+    canBus.begin(CAN_BITRATE, PIN_CAN_R, PIN_CAN_D);
+
+    printHelp();
+    printStatus();
+}
+
+void loop() {
+    readSerial();
+    handleCanRx();
+
+    const uint32_t now = millis();
+    if (now - lastCanStatusTxMs >= CAN_STATUS_TX_INTERVAL_MS) {
+        lastCanStatusTxMs = now;
+        sendCanStatusControl();
+    }
+}

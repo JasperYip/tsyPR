@@ -28,7 +28,7 @@ void setup() {
   pitch.setSpeed(3000);  // slower = more reliable
 
   if (pitch.faultActive()) {
-    Serial.println("⚠️ Pitch fault!");
+    Serial.println("WARNING: Pitch fault!");
   } else {
     Serial.println("Pitch OK");
   }

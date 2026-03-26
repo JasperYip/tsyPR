@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include "config/constants.hpp"
 #include "config/pin_map.hpp"
@@ -19,10 +20,6 @@ static constexpr float PITCH_HOME_SPEED_STEPS_S = 700.0f;
 static constexpr float ROLL_HOME_SPEED_STEPS_S = 700.0f;
 static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
 static constexpr uint32_t ROLL_HOME_MAX_STEPS = 15000;
-static constexpr float AUTO_PITCH_MIN_MM = -60.0f;
-static constexpr float AUTO_PITCH_MAX_MM = 60.0f;
-static constexpr float AUTO_ROLL_MIN_DEG = -25.0f;
-static constexpr float AUTO_ROLL_MAX_DEG = 25.0f;
 
 StepperDriver pitch({
     .pin_step = PIN_PITCH_STEP,
@@ -82,6 +79,33 @@ StepperDriver::Direction opposite(StepperDriver::Direction d) {
     return (d == StepperDriver::Direction::CW)
         ? StepperDriver::Direction::CCW
         : StepperDriver::Direction::CW;
+}
+
+float clampf(float v, float minV, float maxV) {
+    if (v < minV) return minV;
+    if (v > maxV) return maxV;
+    return v;
+}
+
+bool parseFloatStrict(const String& text, float& outValue) {
+    String token = text;
+    token.trim();
+    if (token.length() == 0) {
+        return false;
+    }
+
+    const char* begin = token.c_str();
+    char* end = nullptr;
+    outValue = strtof(begin, &end);
+    if (end == begin) {
+        return false;
+    }
+
+    while (*end == ' ' || *end == '\t') {
+        ++end;
+    }
+
+    return (*end == '\0') && isfinite(outValue);
 }
 
 bool homePitch();
@@ -206,16 +230,14 @@ void movePitchToMmAbs(float targetMm) {
         return;
     }
 
-    if (targetMm < AUTO_PITCH_MIN_MM || targetMm > AUTO_PITCH_MAX_MM) {
-        Serial.print("Pitch target out of range [");
-        Serial.print(AUTO_PITCH_MIN_MM, 2);
-        Serial.print(", ");
-        Serial.print(AUTO_PITCH_MAX_MM, 2);
-        Serial.println("] mm");
-        return;
+    const float clampedMm = clampf(targetMm, config::PITCH_MIN_MM, config::PITCH_MAX_MM);
+    if (clampedMm != targetMm) {
+        Serial.print("Pitch target clamped to ");
+        Serial.print(clampedMm, 3);
+        Serial.println(" mm");
     }
 
-    const int32_t targetSteps = pitchMmToSteps(targetMm);
+    const int32_t targetSteps = pitchMmToSteps(clampedMm);
     const int32_t delta = targetSteps - pitchSteps;
     if (delta == 0) {
         Serial.println("Pitch already at requested absolute target");
@@ -244,16 +266,14 @@ void moveRollToDegAbs(float targetDeg) {
         return;
     }
 
-    if (targetDeg < AUTO_ROLL_MIN_DEG || targetDeg > AUTO_ROLL_MAX_DEG) {
-        Serial.print("Roll target out of range [");
-        Serial.print(AUTO_ROLL_MIN_DEG, 2);
-        Serial.print(", ");
-        Serial.print(AUTO_ROLL_MAX_DEG, 2);
-        Serial.println("] deg");
-        return;
+    const float clampedDeg = clampf(targetDeg, config::ROLL_MIN_DEG, config::ROLL_MAX_DEG);
+    if (clampedDeg != targetDeg) {
+        Serial.print("Roll target clamped to ");
+        Serial.print(clampedDeg, 3);
+        Serial.println(" deg");
     }
 
-    const int32_t targetSteps = rollDegToSteps(targetDeg);
+    const int32_t targetSteps = rollDegToSteps(clampedDeg);
     const int32_t delta = targetSteps - rollSteps;
     if (delta == 0) {
         Serial.println("Roll already at requested absolute target");
@@ -604,9 +624,8 @@ void handleCommand(String cmd) {
             return;
         }
         String arg = cmd.substring(2);
-        arg.trim();
-        float mm = arg.toFloat();
-        if (mm <= 0.0f) {
+        float mm = 0.0f;
+        if (!parseFloatStrict(arg, mm) || mm <= 0.0f) {
             Serial.println("Invalid pitch mm. Example: pm 5");
             return;
         }
@@ -648,9 +667,8 @@ void handleCommand(String cmd) {
             return;
         }
         String arg = cmd.substring(2);
-        arg.trim();
-        float deg = arg.toFloat();
-        if (deg <= 0.0f) {
+        float deg = 0.0f;
+        if (!parseFloatStrict(arg, deg) || deg <= 0.0f) {
             Serial.println("Invalid roll deg. Example: rm 5");
             return;
         }
@@ -688,8 +706,11 @@ void handleCommand(String cmd) {
     // AUTO pitch absolute
     if (cmd.startsWith("ap")) {
         String arg = cmd.substring(2);
-        arg.trim();
-        float mm = arg.toFloat();
+        float mm = 0.0f;
+        if (!parseFloatStrict(arg, mm)) {
+            Serial.println("Invalid pitch absolute target. Example: ap 12.5");
+            return;
+        }
         movePitchToMmAbs(mm);
         printStatus();
         return;
@@ -698,8 +719,11 @@ void handleCommand(String cmd) {
     // AUTO roll absolute
     if (cmd.startsWith("ar")) {
         String arg = cmd.substring(2);
-        arg.trim();
-        float deg = arg.toFloat();
+        float deg = 0.0f;
+        if (!parseFloatStrict(arg, deg)) {
+            Serial.println("Invalid roll absolute target. Example: ar -6.0");
+            return;
+        }
         moveRollToDegAbs(deg);
         printStatus();
         return;
@@ -729,8 +753,12 @@ void handleCommand(String cmd) {
             return;
         }
 
-        const float pMm = pStr.toFloat();
-        const float rDeg = rStr.toFloat();
+        float pMm = 0.0f;
+        float rDeg = 0.0f;
+        if (!parseFloatStrict(pStr, pMm) || !parseFloatStrict(rStr, rDeg)) {
+            Serial.println("Invalid goto values. Example: goto 12.5 -6.0");
+            return;
+        }
         movePitchToMmAbs(pMm);
         moveRollToDegAbs(rDeg);
         printStatus();

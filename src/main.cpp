@@ -19,10 +19,6 @@ static constexpr float PITCH_HOME_SPEED_STEPS_S = 700.0f;
 static constexpr float ROLL_HOME_SPEED_STEPS_S = 700.0f;
 static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
 static constexpr uint32_t ROLL_HOME_MAX_STEPS = 15000;
-static constexpr float AUTO_PITCH_MIN_MM = -60.0f;
-static constexpr float AUTO_PITCH_MAX_MM = 60.0f;
-static constexpr float AUTO_ROLL_MIN_DEG = -25.0f;
-static constexpr float AUTO_ROLL_MAX_DEG = 25.0f;
 
 StepperDriver pitch({
     .pin_step = PIN_PITCH_STEP,
@@ -82,6 +78,12 @@ StepperDriver::Direction opposite(StepperDriver::Direction d) {
     return (d == StepperDriver::Direction::CW)
         ? StepperDriver::Direction::CCW
         : StepperDriver::Direction::CW;
+}
+
+float clampf(float v, float minV, float maxV) {
+    if (v < minV) return minV;
+    if (v > maxV) return maxV;
+    return v;
 }
 
 bool homePitch();
@@ -206,16 +208,14 @@ void movePitchToMmAbs(float targetMm) {
         return;
     }
 
-    if (targetMm < AUTO_PITCH_MIN_MM || targetMm > AUTO_PITCH_MAX_MM) {
-        Serial.print("Pitch target out of range [");
-        Serial.print(AUTO_PITCH_MIN_MM, 2);
-        Serial.print(", ");
-        Serial.print(AUTO_PITCH_MAX_MM, 2);
-        Serial.println("] mm");
-        return;
+    const float clampedMm = clampf(targetMm, config::PITCH_MIN_MM, config::PITCH_MAX_MM);
+    if (clampedMm != targetMm) {
+        Serial.print("Pitch target clamped to ");
+        Serial.print(clampedMm, 3);
+        Serial.println(" mm");
     }
 
-    const int32_t targetSteps = pitchMmToSteps(targetMm);
+    const int32_t targetSteps = pitchMmToSteps(clampedMm);
     const int32_t delta = targetSteps - pitchSteps;
     if (delta == 0) {
         Serial.println("Pitch already at requested absolute target");
@@ -244,16 +244,14 @@ void moveRollToDegAbs(float targetDeg) {
         return;
     }
 
-    if (targetDeg < AUTO_ROLL_MIN_DEG || targetDeg > AUTO_ROLL_MAX_DEG) {
-        Serial.print("Roll target out of range [");
-        Serial.print(AUTO_ROLL_MIN_DEG, 2);
-        Serial.print(", ");
-        Serial.print(AUTO_ROLL_MAX_DEG, 2);
-        Serial.println("] deg");
-        return;
+    const float clampedDeg = clampf(targetDeg, config::ROLL_MIN_DEG, config::ROLL_MAX_DEG);
+    if (clampedDeg != targetDeg) {
+        Serial.print("Roll target clamped to ");
+        Serial.print(clampedDeg, 3);
+        Serial.println(" deg");
     }
 
-    const int32_t targetSteps = rollDegToSteps(targetDeg);
+    const int32_t targetSteps = rollDegToSteps(clampedDeg);
     const int32_t delta = targetSteps - rollSteps;
     if (delta == 0) {
         Serial.println("Roll already at requested absolute target");
