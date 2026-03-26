@@ -10,8 +10,8 @@
 
 // Paste this into src/main.cpp for manual direction checks.
 // Goal:
-// 1) Verify pitch forward/backward wiring
-// 2) Verify roll CW/CCW wiring
+// 1 Verify pitch forward/backward wiring
+// 2 Verify roll CW/CCW wiring
 //
 // If a direction is reversed physically, only change these two constants.
 static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CW;

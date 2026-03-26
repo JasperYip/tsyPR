@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include "config/constants.hpp"
 #include "config/pin_map.hpp"
@@ -9,8 +10,8 @@
 
 // Paste this into src/main.cpp for manual direction checks.
 // Goal:
-// 1) Verify pitch forward/backward wiring
-// 2) Verify roll CW/CCW wiring
+// 1 Verify pitch forward/backward wiring
+// 2 Verify roll CW/CCW wiring
 //
 // If a direction is reversed physically, only change these two constants.
 static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CW;
@@ -84,6 +85,27 @@ float clampf(float v, float minV, float maxV) {
     if (v < minV) return minV;
     if (v > maxV) return maxV;
     return v;
+}
+
+bool parseFloatStrict(const String& text, float& outValue) {
+    String token = text;
+    token.trim();
+    if (token.length() == 0) {
+        return false;
+    }
+
+    const char* begin = token.c_str();
+    char* end = nullptr;
+    outValue = strtof(begin, &end);
+    if (end == begin) {
+        return false;
+    }
+
+    while (*end == ' ' || *end == '\t') {
+        ++end;
+    }
+
+    return (*end == '\0') && isfinite(outValue);
 }
 
 bool homePitch();
@@ -602,9 +624,8 @@ void handleCommand(String cmd) {
             return;
         }
         String arg = cmd.substring(2);
-        arg.trim();
-        float mm = arg.toFloat();
-        if (mm <= 0.0f) {
+        float mm = 0.0f;
+        if (!parseFloatStrict(arg, mm) || mm <= 0.0f) {
             Serial.println("Invalid pitch mm. Example: pm 5");
             return;
         }
@@ -646,9 +667,8 @@ void handleCommand(String cmd) {
             return;
         }
         String arg = cmd.substring(2);
-        arg.trim();
-        float deg = arg.toFloat();
-        if (deg <= 0.0f) {
+        float deg = 0.0f;
+        if (!parseFloatStrict(arg, deg) || deg <= 0.0f) {
             Serial.println("Invalid roll deg. Example: rm 5");
             return;
         }
@@ -686,8 +706,11 @@ void handleCommand(String cmd) {
     // AUTO pitch absolute
     if (cmd.startsWith("ap")) {
         String arg = cmd.substring(2);
-        arg.trim();
-        float mm = arg.toFloat();
+        float mm = 0.0f;
+        if (!parseFloatStrict(arg, mm)) {
+            Serial.println("Invalid pitch absolute target. Example: ap 12.5");
+            return;
+        }
         movePitchToMmAbs(mm);
         printStatus();
         return;
@@ -696,8 +719,11 @@ void handleCommand(String cmd) {
     // AUTO roll absolute
     if (cmd.startsWith("ar")) {
         String arg = cmd.substring(2);
-        arg.trim();
-        float deg = arg.toFloat();
+        float deg = 0.0f;
+        if (!parseFloatStrict(arg, deg)) {
+            Serial.println("Invalid roll absolute target. Example: ar -6.0");
+            return;
+        }
         moveRollToDegAbs(deg);
         printStatus();
         return;
@@ -727,8 +753,12 @@ void handleCommand(String cmd) {
             return;
         }
 
-        const float pMm = pStr.toFloat();
-        const float rDeg = rStr.toFloat();
+        float pMm = 0.0f;
+        float rDeg = 0.0f;
+        if (!parseFloatStrict(pStr, pMm) || !parseFloatStrict(rStr, rDeg)) {
+            Serial.println("Invalid goto values. Example: goto 12.5 -6.0");
+            return;
+        }
         movePitchToMmAbs(pMm);
         moveRollToDegAbs(rDeg);
         printStatus();
