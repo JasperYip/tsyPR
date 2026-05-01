@@ -19,6 +19,12 @@
 //   - Runs pitch or roll homing on command with verbose phase logs.
 //   - Reports final position in mm / deg after homing.
 //
+// Roll homing logic:
+//   R1: CCW until hall active  -> -60 deg magnet (limitCCW)
+//   R2: CW, exit magnet, sweep -> +60 deg magnet (limitCW)
+//   R3: move to midpoint (limitCCW+limitCW)/2, zero counter
+//   Expects ~120 deg span between the two magnets.
+//
 // Commands:
 //   sensors     print sensor states once
 //   live on/off toggle 1 Hz auto-print
@@ -248,6 +254,7 @@ static bool homePitch() {
 static bool homeRoll() {
     Serial.println();
     Serial.println(">>> ROLL HOMING START");
+    Serial.println("Assumes mechanism starts near centre (not on a magnet).");
     rollHomed = false;
     bool ok = false;
 
@@ -257,85 +264,74 @@ static bool homeRoll() {
         uint32_t moved = 0;
 
         // ----------------------------------------------------------
-        // Phase 1: CW until hall is inactive.
-        // Ensures we start outside any magnet zone.
+        // Phase 1: CCW until hall active — finds the -60 deg magnet.
         // ----------------------------------------------------------
-        Serial.println("[R1] CW until hall is inactive (escaping magnet zone)...");
-        roll.setDirection(ROLL_CW_DIR);
-
-        while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
-            if (roll.faultActive()) { Serial.println("[R1] ABORT: driver fault"); break; }
-            roll.step();
-            rollSteps++;
-            moved++;
-        }
-
-        if (rollHall.isActive()) {
-            Serial.print("[R1] FAILED after "); Serial.print(moved);
-            Serial.println(" steps — hall still active (magnet zone too wide?)");
-            break;
-        }
-        Serial.print("[R1] Hall cleared after "); Serial.print(moved); Serial.println(" steps");
-
-        // ----------------------------------------------------------
-        // Phase 2: CCW until hall becomes active (entry edge).
-        // ----------------------------------------------------------
-        Serial.println("[R2] CCW seeking hall entry edge...");
+        Serial.println("[R1] CCW seeking -60 magnet...");
         roll.setDirection(opposite(ROLL_CW_DIR));
-        moved = 0;
 
         while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
-            if (roll.faultActive()) { Serial.println("[R2] ABORT: driver fault"); break; }
+            if (roll.faultActive()) { Serial.println("[R1] ABORT: driver fault"); break; }
             roll.step();
             rollSteps--;
             moved++;
         }
 
         if (!rollHall.isActive()) {
-            Serial.print("[R2] FAILED after "); Serial.print(moved);
-            Serial.println(" steps — hall entry edge not found");
+            Serial.print("[R1] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — -60 magnet not found");
             break;
         }
-        const int32_t hallEnter = rollSteps;
-        Serial.print("[R2] Hall entry at step "); Serial.println(hallEnter);
+        const int32_t limitCCW = rollSteps;
+        Serial.print("[R1] -60 magnet found at step "); Serial.print(limitCCW);
+        Serial.print(" ("); Serial.print(limitCCW * config::ROLL_STEP_DEG, 2); Serial.println(" deg)");
 
         // ----------------------------------------------------------
-        // Phase 3: keep CCW until hall goes inactive (exit edge).
+        // Phase 2: CW — exit the -60 magnet, sweep to +60 magnet.
         // ----------------------------------------------------------
-        Serial.println("[R3] CCW seeking hall exit edge...");
+        Serial.println("[R2] CW — exiting -60 magnet then seeking +60 magnet...");
+        roll.setDirection(ROLL_CW_DIR);
         moved = 0;
 
+        // exit the -60 magnet first
         while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
-            if (roll.faultActive()) { Serial.println("[R3] ABORT: driver fault"); break; }
+            if (roll.faultActive()) { Serial.println("[R2] ABORT: driver fault"); break; }
             roll.step();
-            rollSteps--;
+            rollSteps++;
             moved++;
         }
-
         if (rollHall.isActive()) {
-            Serial.print("[R3] FAILED after "); Serial.print(moved);
-            Serial.println(" steps — hall exit edge not found");
+            Serial.println("[R2] FAILED: could not exit -60 magnet");
             break;
         }
-        const int32_t hallExit = rollSteps;
-        Serial.print("[R3] Hall exit at step "); Serial.println(hallExit);
+        Serial.println("[R2] Exited -60 magnet, continuing CW...");
 
-        const int32_t band = hallEnter - hallExit;
-        Serial.print("[R3] Hall band = "); Serial.print(band);
-        Serial.print(" steps = "); Serial.print(band * config::ROLL_STEP_DEG, 2);
-        Serial.println(" deg");
-
-        if (band <= 0) {
-            Serial.println("[R3] FAILED: hall band invalid");
+        // sweep CW to the +60 magnet
+        while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            if (roll.faultActive()) { Serial.println("[R2] ABORT: driver fault"); break; }
+            roll.step();
+            rollSteps++;
+            moved++;
+        }
+        if (!rollHall.isActive()) {
+            Serial.print("[R2] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — +60 magnet not found");
             break;
         }
+        const int32_t limitCW = rollSteps;
+        Serial.print("[R2] +60 magnet found at step "); Serial.print(limitCW);
+        Serial.print(" ("); Serial.print(limitCW * config::ROLL_STEP_DEG, 2); Serial.println(" deg)");
+
+        const int32_t span = limitCW - limitCCW;
+        Serial.print("[R2] Span = "); Serial.print(span);
+        Serial.print(" steps = "); Serial.print(span * config::ROLL_STEP_DEG, 2);
+        Serial.println(" deg  (expect ~120)");
 
         // ----------------------------------------------------------
-        // Phase 4: move to center of hall band, zero the counter.
+        // Phase 3: move to midpoint between the two magnets, zero.
         // ----------------------------------------------------------
-        const int32_t center = hallExit + (band / 2);
+        const int32_t center = (limitCCW + limitCW) / 2;
         const int32_t delta  = center - rollSteps;
-        Serial.print("[R4] moving to hall band center at step "); Serial.println(center);
+        Serial.print("[R3] Moving to midpoint step "); Serial.println(center);
 
         if (delta != 0) {
             const bool cw = delta > 0;
@@ -343,7 +339,7 @@ static bool homeRoll() {
             const uint32_t n = absI32(delta);
             for (uint32_t i = 0; i < n; i++) {
                 if (roll.faultActive()) {
-                    Serial.println("[R4] ABORT: driver fault while centering");
+                    Serial.println("[R3] ABORT: driver fault while centering");
                     break;
                 }
                 roll.step();
@@ -360,7 +356,7 @@ static bool homeRoll() {
     } while (false);
 
     if (ok) {
-        Serial.println(">>> ROLL HOMING OK — position zeroed at hall band center");
+        Serial.println(">>> ROLL HOMING OK — midpoint between magnets zeroed");
     } else {
         Serial.println(">>> ROLL HOMING FAILED");
     }
