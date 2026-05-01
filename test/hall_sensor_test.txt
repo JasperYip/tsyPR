@@ -1,0 +1,82 @@
+#include <Arduino.h>
+
+#include "config/pin_map.hpp"
+
+// Paste this into src/main.cpp to run a hall-only sensor test.
+// Prints raw GPIO state and interpreted hall output every 2 seconds.
+// Serial commands:
+//   p -> toggle internal pullup (INPUT <-> INPUT_PULLUP)
+//   a -> toggle polarity (active_low <-> active_high)
+//   h -> print help/config
+
+static constexpr uint8_t HALL_PIN = PIN_HALL_SENS;
+static constexpr uint32_t PRINT_INTERVAL_MS = 2000;
+
+bool g_usePullup = false;
+bool g_activeLow = true;
+uint32_t g_lastPrintMs = 0;
+
+void applyHallPinMode() {
+    pinMode(HALL_PIN, g_usePullup ? INPUT_PULLUP : INPUT);
+}
+
+void printConfig() {
+    Serial.print("config: pin=");
+    Serial.print(HALL_PIN);
+    Serial.print(", pullup=");
+    Serial.print(g_usePullup ? "ON" : "OFF");
+    Serial.print(", polarity=");
+    Serial.println(g_activeLow ? "ACTIVE_LOW" : "ACTIVE_HIGH");
+}
+
+void printHelp() {
+    Serial.println("commands: p=toggle pullup, a=toggle polarity, h=help");
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+
+    Serial.println("Hall Sensor Test Start");
+    applyHallPinMode();
+    printHelp();
+    printConfig();
+    g_lastPrintMs = millis();
+}
+
+void loop() {
+    while (Serial.available() > 0) {
+        const char c = static_cast<char>(Serial.read());
+        if (c == 'p' || c == 'P') {
+            g_usePullup = !g_usePullup;
+            applyHallPinMode();
+            printConfig();
+        } else if (c == 'a' || c == 'A') {
+            g_activeLow = !g_activeLow;
+            printConfig();
+        } else if (c == 'h' || c == 'H') {
+            printHelp();
+            printConfig();
+        }
+    }
+
+    const uint32_t now = millis();
+    if (now - g_lastPrintMs >= PRINT_INTERVAL_MS) {
+        g_lastPrintMs = now;
+
+        const bool rawHall = (digitalRead(HALL_PIN) == HIGH);
+        const bool hallOut = g_activeLow ? !rawHall : rawHall;
+        const int hallAnalog = analogRead(HALL_PIN);
+
+        Serial.print("raw_hall_sensor=");
+        Serial.print(rawHall ? "HIGH" : "LOW");
+        Serial.print(" (");
+        Serial.print(rawHall ? 1 : 0);
+        Serial.print("), hall_sensor_output=");
+        Serial.print(hallOut ? "ACTIVE" : "INACTIVE");
+        Serial.print(" (");
+        Serial.print(hallOut ? 1 : 0);
+        Serial.print("), hall_analog=");
+        Serial.println(hallAnalog);
+    }
+}

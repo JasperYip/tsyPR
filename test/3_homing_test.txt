@@ -1,0 +1,447 @@
+#include <Arduino.h>
+#include <math.h>
+#include <stdlib.h>
+
+#include "config/constants.hpp"
+#include "config/pin_map.hpp"
+#include "drivers/hall_sensor.hpp"
+#include "drivers/push_switch.hpp"
+#include "drivers/stepper_driver.hpp"
+
+// ============================================================
+// HOMING TEST
+// ============================================================
+// Paste this into src/main.cpp to test homing independently.
+//
+// What this does:
+//   - Prints FWD limit / BWD limit / Hall sensor state every 1s
+//     so you can verify sensor wiring before running any motors.
+//   - Runs pitch or roll homing on command with verbose phase logs.
+//   - Reports final position in mm / deg after homing.
+//
+// Commands:
+//   sensors     print sensor states once
+//   live on/off toggle 1 Hz auto-print
+//   homep       run pitch homing sequence
+//   homer       run roll homing sequence
+//   home        run both
+//   status      position + sensor snapshot
+//   help        this message
+// ============================================================
+
+static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CW;
+static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Direction::CW;
+
+static constexpr float    PITCH_HOME_SPEED     = 700.0f;
+static constexpr float    ROLL_HOME_SPEED      = 700.0f;
+static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
+static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
+
+static StepperDriver pitch({
+    .pin_step       = PIN_PITCH_STEP,
+    .pin_dir        = PIN_PITCH_DIR,
+    .pin_en         = PIN_PITCH_ENA,
+    .pin_flt        = PIN_PITCH_FLT,
+    .step_pulse_us  = 5.0f,
+    .steps_per_sec  = PITCH_HOME_SPEED,
+    .flt_active_low = true,
+    .en_active_low  = true
+});
+
+static StepperDriver roll({
+    .pin_step       = PIN_ROLL_STEP,
+    .pin_dir        = PIN_ROLL_DIR,
+    .pin_en         = PIN_ROLL_ENA,
+    .pin_flt        = PIN_ROLL_FLT,
+    .step_pulse_us  = 5.0f,
+    .steps_per_sec  = ROLL_HOME_SPEED,
+    .flt_active_low = true,
+    .en_active_low  = true
+});
+
+static PushSwitch pitchFwdLimit({ .pin = PIN_FWD_SWH,   .active_low = true, .use_pullup = true });
+static PushSwitch pitchRevLimit({ .pin = PIN_BWD_SWH,   .active_low = true, .use_pullup = true });
+static HallSensor rollHall     ({ .pin = PIN_HALL_SENS, .active_low = true, .use_pullup = true });
+
+static int32_t pitchSteps = 0;
+static int32_t rollSteps  = 0;
+static bool    pitchHomed = false;
+static bool    rollHomed  = false;
+static bool    liveMode   = true;   // 1 Hz auto-print on by default
+static String  rx;
+
+static uint32_t lastLivePrint = 0;
+
+// ----------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------
+static StepperDriver::Direction opposite(StepperDriver::Direction d) {
+    return d == StepperDriver::Direction::CW
+        ? StepperDriver::Direction::CCW : StepperDriver::Direction::CW;
+}
+
+static float pitchStepsToMm(int32_t s) { return s * config::PITCH_STEP_MM; }
+static float rollStepsToDeg(int32_t s) { return s * config::ROLL_STEP_DEG; }
+
+static uint32_t absI32(int32_t v) {
+    return v >= 0 ? (uint32_t)v : (uint32_t)(-v);
+}
+
+// ----------------------------------------------------------------
+// Sensor print (called at 1 Hz and on demand)
+// ----------------------------------------------------------------
+static void printSensors() {
+    Serial.print("[sensors]  FWD=");
+    Serial.print(pitchFwdLimit.isPressed() ? "PRESSED" : "open   ");
+    Serial.print("  BWD=");
+    Serial.print(pitchRevLimit.isPressed() ? "PRESSED" : "open   ");
+    Serial.print("  HALL=");
+    Serial.print(rollHall.isActive() ? "ACTIVE " : "inactive");
+    Serial.print("  flt_P=");
+    Serial.print(pitch.faultActive() ? "FAULT" : "ok");
+    Serial.print("  flt_R=");
+    Serial.println(roll.faultActive() ? "FAULT" : "ok");
+}
+
+static void printStatus() {
+    Serial.println();
+    Serial.print("homed_P="); Serial.print(pitchHomed ? "YES" : "NO");
+    Serial.print("  pitch="); Serial.print(pitchStepsToMm(pitchSteps), 3);
+    Serial.print(" mm  ("); Serial.print(pitchSteps); Serial.println(" steps)");
+
+    Serial.print("homed_R="); Serial.print(rollHomed ? "YES" : "NO");
+    Serial.print("  roll=");  Serial.print(rollStepsToDeg(rollSteps), 3);
+    Serial.print(" deg  ("); Serial.print(rollSteps); Serial.println(" steps)");
+
+    printSensors();
+}
+
+static void printHelp() {
+    Serial.println();
+    Serial.println("=== HOMING TEST ===");
+    Serial.println("sensors     : print sensor states once");
+    Serial.println("live on/off : toggle 1 Hz auto sensor print");
+    Serial.println("homep       : run pitch homing");
+    Serial.println("homer       : run roll homing");
+    Serial.println("home        : run pitch + roll homing");
+    Serial.println("status      : position + sensor snapshot");
+    Serial.println("help        : this message");
+    Serial.println();
+    Serial.println("Tip: watch the 1 Hz line while manually pressing");
+    Serial.println("     the switches / moving the roll mechanism");
+    Serial.println("     to verify sensors read correctly BEFORE homing.");
+    Serial.println();
+}
+
+// ----------------------------------------------------------------
+// Pitch homing
+// ----------------------------------------------------------------
+static bool homePitch() {
+    Serial.println();
+    Serial.println(">>> PITCH HOMING START");
+    pitchHomed = false;
+    bool ok = false;
+
+    pitch.setSpeed(PITCH_HOME_SPEED);
+
+    do {
+        // ----------------------------------------------------------
+        // Phase 1: move FORWARD until FWD limit switch presses.
+        // ----------------------------------------------------------
+        Serial.println("[P1] seeking FWD limit switch...");
+        pitch.setDirection(PITCH_FORWARD_DIR);
+
+        uint32_t moved = 0;
+        while (!pitchFwdLimit.isPressed() && moved < PITCH_HOME_MAX_STEPS) {
+            if (pitch.faultActive()) {
+                Serial.println("[P1] ABORT: driver fault");
+                break;
+            }
+            pitch.step();
+            pitchSteps++;
+            moved++;
+        }
+
+        if (!pitchFwdLimit.isPressed()) {
+            Serial.print("[P1] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — FWD limit not reached");
+            break;
+        }
+        const int32_t fwdHit = pitchSteps;
+        Serial.print("[P1] FWD limit hit at step "); Serial.println(fwdHit);
+
+        // ----------------------------------------------------------
+        // Phase 2: move BACKWARD until BWD limit switch presses.
+        // ----------------------------------------------------------
+        Serial.println("[P2] seeking BWD limit switch...");
+        pitch.setDirection(opposite(PITCH_FORWARD_DIR));
+
+        moved = 0;
+        while (!pitchRevLimit.isPressed() && moved < PITCH_HOME_MAX_STEPS) {
+            if (pitch.faultActive()) {
+                Serial.println("[P2] ABORT: driver fault");
+                break;
+            }
+            pitch.step();
+            pitchSteps--;
+            moved++;
+        }
+
+        if (!pitchRevLimit.isPressed()) {
+            Serial.print("[P2] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — BWD limit not reached");
+            break;
+        }
+        const int32_t revHit = pitchSteps;
+        Serial.print("[P2] BWD limit hit at step "); Serial.println(revHit);
+
+        const int32_t span = fwdHit - revHit;
+        Serial.print("[P2] Span = "); Serial.print(span);
+        Serial.print(" steps = "); Serial.print(span * config::PITCH_STEP_MM, 2);
+        Serial.println(" mm");
+
+        if (span <= 0) {
+            Serial.println("[P2] FAILED: span invalid (FWD hit <= BWD hit)");
+            break;
+        }
+
+        // ----------------------------------------------------------
+        // Phase 3: move to center, zero the counter.
+        // ----------------------------------------------------------
+        const int32_t center = revHit + (span / 2);
+        const int32_t delta  = center - pitchSteps;
+        Serial.print("[P3] moving to center at step "); Serial.println(center);
+
+        if (delta != 0) {
+            const bool fwd = delta > 0;
+            pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
+            const uint32_t n = absI32(delta);
+            for (uint32_t i = 0; i < n; i++) {
+                if (pitch.faultActive()) {
+                    Serial.println("[P3] ABORT: driver fault while centering");
+                    break;
+                }
+                pitch.step();
+                pitchSteps += fwd ? 1 : -1;
+            }
+            if (pitch.faultActive()) break;
+        }
+
+        pitchSteps = 0;
+        pitch.setDirection(PITCH_FORWARD_DIR);
+        pitchHomed = true;
+        ok = true;
+
+    } while (false);
+
+    if (ok) {
+        Serial.println(">>> PITCH HOMING OK — position zeroed at center");
+    } else {
+        Serial.println(">>> PITCH HOMING FAILED");
+    }
+    return ok;
+}
+
+// ----------------------------------------------------------------
+// Roll homing
+// ----------------------------------------------------------------
+static bool homeRoll() {
+    Serial.println();
+    Serial.println(">>> ROLL HOMING START");
+    rollHomed = false;
+    bool ok = false;
+
+    roll.setSpeed(ROLL_HOME_SPEED);
+
+    do {
+        uint32_t moved = 0;
+
+        // ----------------------------------------------------------
+        // Phase 1: CW until hall is inactive.
+        // Ensures we start outside any magnet zone.
+        // ----------------------------------------------------------
+        Serial.println("[R1] CW until hall is inactive (escaping magnet zone)...");
+        roll.setDirection(ROLL_CW_DIR);
+
+        while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            if (roll.faultActive()) { Serial.println("[R1] ABORT: driver fault"); break; }
+            roll.step();
+            rollSteps++;
+            moved++;
+        }
+
+        if (rollHall.isActive()) {
+            Serial.print("[R1] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — hall still active (magnet zone too wide?)");
+            break;
+        }
+        Serial.print("[R1] Hall cleared after "); Serial.print(moved); Serial.println(" steps");
+
+        // ----------------------------------------------------------
+        // Phase 2: CCW until hall becomes active (entry edge).
+        // ----------------------------------------------------------
+        Serial.println("[R2] CCW seeking hall entry edge...");
+        roll.setDirection(opposite(ROLL_CW_DIR));
+        moved = 0;
+
+        while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            if (roll.faultActive()) { Serial.println("[R2] ABORT: driver fault"); break; }
+            roll.step();
+            rollSteps--;
+            moved++;
+        }
+
+        if (!rollHall.isActive()) {
+            Serial.print("[R2] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — hall entry edge not found");
+            break;
+        }
+        const int32_t hallEnter = rollSteps;
+        Serial.print("[R2] Hall entry at step "); Serial.println(hallEnter);
+
+        // ----------------------------------------------------------
+        // Phase 3: keep CCW until hall goes inactive (exit edge).
+        // ----------------------------------------------------------
+        Serial.println("[R3] CCW seeking hall exit edge...");
+        moved = 0;
+
+        while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            if (roll.faultActive()) { Serial.println("[R3] ABORT: driver fault"); break; }
+            roll.step();
+            rollSteps--;
+            moved++;
+        }
+
+        if (rollHall.isActive()) {
+            Serial.print("[R3] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — hall exit edge not found");
+            break;
+        }
+        const int32_t hallExit = rollSteps;
+        Serial.print("[R3] Hall exit at step "); Serial.println(hallExit);
+
+        const int32_t band = hallEnter - hallExit;
+        Serial.print("[R3] Hall band = "); Serial.print(band);
+        Serial.print(" steps = "); Serial.print(band * config::ROLL_STEP_DEG, 2);
+        Serial.println(" deg");
+
+        if (band <= 0) {
+            Serial.println("[R3] FAILED: hall band invalid");
+            break;
+        }
+
+        // ----------------------------------------------------------
+        // Phase 4: move to center of hall band, zero the counter.
+        // ----------------------------------------------------------
+        const int32_t center = hallExit + (band / 2);
+        const int32_t delta  = center - rollSteps;
+        Serial.print("[R4] moving to hall band center at step "); Serial.println(center);
+
+        if (delta != 0) {
+            const bool cw = delta > 0;
+            roll.setDirection(cw ? ROLL_CW_DIR : opposite(ROLL_CW_DIR));
+            const uint32_t n = absI32(delta);
+            for (uint32_t i = 0; i < n; i++) {
+                if (roll.faultActive()) {
+                    Serial.println("[R4] ABORT: driver fault while centering");
+                    break;
+                }
+                roll.step();
+                rollSteps += cw ? 1 : -1;
+            }
+            if (roll.faultActive()) break;
+        }
+
+        rollSteps = 0;
+        roll.setDirection(ROLL_CW_DIR);
+        rollHomed = true;
+        ok = true;
+
+    } while (false);
+
+    if (ok) {
+        Serial.println(">>> ROLL HOMING OK — position zeroed at hall band center");
+    } else {
+        Serial.println(">>> ROLL HOMING FAILED");
+    }
+    return ok;
+}
+
+// ----------------------------------------------------------------
+// Serial command handler
+// ----------------------------------------------------------------
+static void handleCommand(String cmd) {
+    cmd.trim();
+    cmd.toLowerCase();
+    if (cmd.length() == 0) return;
+
+    if (cmd == "help")     { printHelp(); return; }
+    if (cmd == "status")   { printStatus(); return; }
+    if (cmd == "sensors")  { printSensors(); return; }
+    if (cmd == "live on")  { liveMode = true;  Serial.println("Live print ON");  return; }
+    if (cmd == "live off") { liveMode = false; Serial.println("Live print OFF"); return; }
+
+    if (cmd == "homep") {
+        homePitch();
+        printStatus();
+        return;
+    }
+    if (cmd == "homer") {
+        homeRoll();
+        printStatus();
+        return;
+    }
+    if (cmd == "home") {
+        bool p = homePitch();
+        bool r = homeRoll();
+        Serial.print("Home summary: pitch="); Serial.print(p ? "OK" : "FAIL");
+        Serial.print("  roll="); Serial.println(r ? "OK" : "FAIL");
+        printStatus();
+        return;
+    }
+
+    Serial.print("Unknown: "); Serial.println(cmd);
+}
+
+static void readSerial() {
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\r' || c == '\n') {
+            if (rx.length() > 0) { handleCommand(rx); rx = ""; }
+        } else {
+            rx += c;
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// Setup / Loop
+// ----------------------------------------------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    pitch.begin();
+    roll.begin();
+    pitchFwdLimit.begin();
+    pitchRevLimit.begin();
+    rollHall.begin();
+
+    pitch.enable();
+    roll.enable();
+
+    printHelp();
+    Serial.println("Live sensor readings active (1 Hz). Manually trigger");
+    Serial.println("each sensor now to confirm they read correctly.");
+    Serial.println("Then type 'homep', 'homer', or 'home' to test homing.");
+    Serial.println();
+}
+
+void loop() {
+    readSerial();
+
+    if (liveMode && millis() - lastLivePrint >= 1000) {
+        lastLivePrint = millis();
+        printSensors();
+    }
+}

@@ -1,0 +1,45 @@
+#include <Arduino.h>
+
+// Paste this into src/main.cpp to run a pin-19 limit switch raw test.
+// Wiring expectation:
+// - Limit switch between pin 19 and GND
+// - Internal pull-up enabled on pin 19
+
+static constexpr uint8_t LIMIT_PIN = 19;
+static constexpr uint32_t PRINT_INTERVAL_MS = 2000;
+
+uint32_t g_lastPrintMs = 0;
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+
+    pinMode(LIMIT_PIN, INPUT_PULLUP);
+
+    Serial.println("Limit Switch Pin 19 Test Start");
+    Serial.println("Mode: INPUT_PULLUP (open = HIGH, pressed-to-GND = LOW)");
+    Serial.print("Pin: ");
+    Serial.println(LIMIT_PIN);
+
+    g_lastPrintMs = millis();
+}
+
+void loop() {
+    const uint32_t now = millis();
+    if (now - g_lastPrintMs >= PRINT_INTERVAL_MS) {
+        g_lastPrintMs = now;
+
+        const bool rawHigh = (digitalRead(LIMIT_PIN) == HIGH);
+        const bool limitPressed = !rawHigh; // active-low with pull-up wiring
+
+        Serial.print("raw_limit_pin19=");
+        Serial.print(rawHigh ? "HIGH" : "LOW");
+        Serial.print(" (");
+        Serial.print(rawHigh ? 1 : 0);
+        Serial.print("), limit_switch_output=");
+        Serial.print(limitPressed ? "PRESSED" : "RELEASED");
+        Serial.print(" (");
+        Serial.print(limitPressed ? 1 : 0);
+        Serial.println(")");
+    }
+}

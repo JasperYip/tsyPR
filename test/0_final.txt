@@ -315,38 +315,44 @@ static bool homeRoll() {
     do {
         uint32_t moved = 0;
 
-        // Phase 1: CCW until hall active — finds the -60 deg magnet
+        // Phase 1: CW until hall inactive (escape magnet zone)
+        roll.setDirection(ROLL_CW_DIR);
+        while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            if (shouldAbortMove()) { Serial.println("Roll abort: safety signal (CW clear)"); break; }
+            roll.step();
+            rollSteps++;
+            moved++;
+        }
+        if (rollHall.isActive()) { Serial.println("Roll homing failed: hall stuck active"); break; }
+
+        // Phase 2: CCW until hall active (entry edge)
         roll.setDirection(opposite(ROLL_CW_DIR));
+        moved = 0;
         while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
-            if (shouldAbortMove()) { Serial.println("Roll abort: safety signal (CCW seek)"); break; }
+            if (shouldAbortMove()) { Serial.println("Roll abort: safety signal (CCW entry)"); break; }
             roll.step();
             rollSteps--;
             moved++;
         }
-        if (!rollHall.isActive()) { Serial.println("Roll homing failed: -60 magnet not found"); break; }
-        const int32_t limitCCW = rollSteps;
+        if (!rollHall.isActive()) { Serial.println("Roll homing failed: hall entry not found"); break; }
+        const int32_t hallEnter = rollSteps;
 
-        // Phase 2: CW — exit the -60 magnet, sweep to the +60 magnet
-        roll.setDirection(ROLL_CW_DIR);
+        // Phase 3: CCW until hall inactive (exit edge)
         moved = 0;
         while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
-            if (shouldAbortMove()) { Serial.println("Roll abort: safety signal (CW exit)"); break; }
+            if (shouldAbortMove()) { Serial.println("Roll abort: safety signal (CCW exit)"); break; }
             roll.step();
-            rollSteps++;
+            rollSteps--;
             moved++;
         }
-        if (rollHall.isActive()) { Serial.println("Roll homing failed: could not exit -60 magnet"); break; }
-        while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
-            if (shouldAbortMove()) { Serial.println("Roll abort: safety signal (CW seek)"); break; }
-            roll.step();
-            rollSteps++;
-            moved++;
-        }
-        if (!rollHall.isActive()) { Serial.println("Roll homing failed: +60 magnet not found"); break; }
-        const int32_t limitCW = rollSteps;
+        if (rollHall.isActive()) { Serial.println("Roll homing failed: hall exit not found"); break; }
+        const int32_t hallExit = rollSteps;
 
-        // Phase 3: move to midpoint between the two magnets and zero
-        const int32_t center = (limitCCW + limitCW) / 2;
+        const int32_t band = hallEnter - hallExit;
+        if (band <= 0) { Serial.println("Roll homing failed: invalid hall band"); break; }
+
+        // Phase 4: move to center of hall band and zero
+        const int32_t center = hallExit + (band / 2);
         if (!moveRollDelta(center - rollSteps)) {
             Serial.println("Roll abort: safety signal (centering)");
             break;
