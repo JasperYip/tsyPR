@@ -26,13 +26,17 @@
 //   Expects ~120 deg span between the two magnets.
 //
 // Commands:
-//   sensors     print sensor states once
-//   live on/off toggle 1 Hz auto-print
-//   homep       run pitch homing sequence
-//   homer       run roll homing sequence
-//   home        run both
-//   status      position + sensor snapshot
-//   help        this message
+//   sensors       print sensor states once
+//   live on/off   toggle 1 Hz auto-print
+//   homep/homer/home  run homing sequences
+//   pf <N>        pitch forward N steps (FWD-limit protected)
+//   pb <N>        pitch backward N steps (BWD-limit protected)
+//   rcw <N>       roll CW N steps
+//   rccw <N>      roll CCW N steps
+//   pen/pdis      enable / disable pitch driver
+//   ren/rdis      enable / disable roll driver
+//   status        position + sensor snapshot
+//   help          this message
 // ============================================================
 
 static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CW;
@@ -40,6 +44,7 @@ static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Dir
 
 static constexpr float    PITCH_HOME_SPEED     = 700.0f;
 static constexpr float    ROLL_HOME_SPEED      = 700.0f;
+static constexpr float    JOG_SPEED            = 400.0f;
 static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
 static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 
@@ -94,6 +99,47 @@ static uint32_t absI32(int32_t v) {
 }
 
 // ----------------------------------------------------------------
+// Jog helpers
+// ----------------------------------------------------------------
+static void jogPitch(int32_t steps) {
+    if (steps == 0) return;
+    pitch.setSpeed(JOG_SPEED);
+    const bool fwd = steps > 0;
+    pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
+    const uint32_t n = absI32(steps);
+    uint32_t moved = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (pitch.faultActive()) { Serial.println("[jog] ABORT pitch: driver fault"); break; }
+        if (fwd  && pitchFwdLimit.isPressed()) { Serial.println("[jog] STOP pitch: FWD limit hit"); break; }
+        if (!fwd && pitchRevLimit.isPressed()) { Serial.println("[jog] STOP pitch: BWD limit hit"); break; }
+        pitch.step();
+        pitchSteps += fwd ? 1 : -1;
+        moved++;
+    }
+    Serial.print("[jog] pitch moved "); Serial.print(fwd ? "+" : "-");
+    Serial.print(moved); Serial.print(" steps  pos=");
+    Serial.print(pitchStepsToMm(pitchSteps), 3); Serial.println(" mm");
+}
+
+static void jogRoll(int32_t steps) {
+    if (steps == 0) return;
+    roll.setSpeed(JOG_SPEED);
+    const bool cw = steps > 0;
+    roll.setDirection(cw ? ROLL_CW_DIR : opposite(ROLL_CW_DIR));
+    const uint32_t n = absI32(steps);
+    uint32_t moved = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (roll.faultActive()) { Serial.println("[jog] ABORT roll: driver fault"); break; }
+        roll.step();
+        rollSteps += cw ? 1 : -1;
+        moved++;
+    }
+    Serial.print("[jog] roll moved "); Serial.print(cw ? "+" : "-");
+    Serial.print(moved); Serial.print(" steps  pos=");
+    Serial.print(rollStepsToDeg(rollSteps), 3); Serial.println(" deg");
+}
+
+// ----------------------------------------------------------------
 // Sensor print (called at 1 Hz and on demand)
 // ----------------------------------------------------------------
 static void printSensors() {
@@ -125,13 +171,22 @@ static void printStatus() {
 static void printHelp() {
     Serial.println();
     Serial.println("=== HOMING TEST ===");
-    Serial.println("sensors     : print sensor states once");
-    Serial.println("live on/off : toggle 1 Hz auto sensor print");
-    Serial.println("homep       : run pitch homing");
-    Serial.println("homer       : run roll homing");
-    Serial.println("home        : run pitch + roll homing");
-    Serial.println("status      : position + sensor snapshot");
-    Serial.println("help        : this message");
+    Serial.println("sensors       : print sensor states once");
+    Serial.println("live on/off   : toggle 1 Hz auto sensor print");
+    Serial.println("--- Homing ---");
+    Serial.println("homep         : run pitch homing");
+    Serial.println("homer         : run roll homing");
+    Serial.println("home          : run pitch + roll homing");
+    Serial.println("status        : position + sensor snapshot");
+    Serial.println("--- Jog (N = step count) ---");
+    Serial.println("pf <N>        : pitch forward N steps  (stops at FWD limit)");
+    Serial.println("pb <N>        : pitch backward N steps (stops at BWD limit)");
+    Serial.println("rcw <N>       : roll CW N steps");
+    Serial.println("rccw <N>      : roll CCW N steps");
+    Serial.println("--- Motor enable ---");
+    Serial.println("pen / pdis    : enable / disable pitch driver");
+    Serial.println("ren / rdis    : enable / disable roll driver");
+    Serial.println("help          : this message");
     Serial.println();
     Serial.println("Tip: watch the 1 Hz line while manually pressing");
     Serial.println("     the switches / moving the roll mechanism");
@@ -393,6 +448,36 @@ static void handleCommand(String cmd) {
         Serial.print("Home summary: pitch="); Serial.print(p ? "OK" : "FAIL");
         Serial.print("  roll="); Serial.println(r ? "OK" : "FAIL");
         printStatus();
+        return;
+    }
+
+    if (cmd == "pen")  { pitch.enable();  Serial.println("Pitch enabled");  return; }
+    if (cmd == "pdis") { pitch.disable(); Serial.println("Pitch disabled"); return; }
+    if (cmd == "ren")  { roll.enable();   Serial.println("Roll enabled");   return; }
+    if (cmd == "rdis") { roll.disable();  Serial.println("Roll disabled");  return; }
+
+    if (cmd.startsWith("pf ")) {
+        int32_t n = cmd.substring(3).toInt();
+        if (n <= 0) { Serial.println("Usage: pf <N>  (N > 0)"); return; }
+        jogPitch(n);
+        return;
+    }
+    if (cmd.startsWith("pb ")) {
+        int32_t n = cmd.substring(3).toInt();
+        if (n <= 0) { Serial.println("Usage: pb <N>  (N > 0)"); return; }
+        jogPitch(-n);
+        return;
+    }
+    if (cmd.startsWith("rcw ")) {
+        int32_t n = cmd.substring(4).toInt();
+        if (n <= 0) { Serial.println("Usage: rcw <N>  (N > 0)"); return; }
+        jogRoll(n);
+        return;
+    }
+    if (cmd.startsWith("rccw ")) {
+        int32_t n = cmd.substring(5).toInt();
+        if (n <= 0) { Serial.println("Usage: rccw <N>  (N > 0)"); return; }
+        jogRoll(-n);
         return;
     }
 

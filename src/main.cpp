@@ -4,54 +4,57 @@
 
 #include "config/constants.hpp"
 #include "config/pin_map.hpp"
-#include "utils/logger.hpp"
-
-#include "drivers/bms.hpp"
-#include "drivers/can_bus.hpp"
 #include "drivers/hall_sensor.hpp"
-#include "drivers/leak_sensor.hpp"
 #include "drivers/push_switch.hpp"
 #include "drivers/stepper_driver.hpp"
 
-#include "controllers/bms_manager.hpp"
-#include "controllers/safety_manager.hpp"
+// ============================================================
+// HOMING TEST
+// ============================================================
+// Paste this into src/main.cpp to test homing independently.
+//
+// What this does:
+//   - Prints FWD limit / BWD limit / Hall sensor state every 1s
+//     so you can verify sensor wiring before running any motors.
+//   - Runs pitch or roll homing on command with verbose phase logs.
+//   - Reports final position in mm / deg after homing.
+//
+// Roll homing logic:
+//   R1: CCW until hall active  -> -60 deg magnet (limitCCW)
+//   R2: CW, exit magnet, sweep -> +60 deg magnet (limitCW)
+//   R3: move to midpoint (limitCCW+limitCW)/2, zero counter
+//   Expects ~120 deg span between the two magnets.
+//
+// Commands:
+//   sensors       print sensor states once
+//   live on/off   toggle 1 Hz auto-print
+//   homep/homer/home  run homing sequences
+//   pf <N>        pitch forward N steps (FWD-limit protected)
+//   pb <N>        pitch backward N steps (BWD-limit protected)
+//   rcw <N>       roll CW N steps
+//   rccw <N>      roll CCW N steps
+//   pen/pdis      enable / disable pitch driver
+//   ren/rdis      enable / disable roll driver
+//   status        position + sensor snapshot
+//   help          this message
+// ============================================================
 
-#include "protocols/can_messages.hpp"
-
-// ----------------------------------------------------------------
-// Direction conventions — flip these if a motor is wired backwards
-// ----------------------------------------------------------------
 static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CW;
 static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Direction::CW;
 
-// ----------------------------------------------------------------
-// Motion parameters
-// ----------------------------------------------------------------
-static constexpr float    PITCH_HOME_SPEED     = 700.0f;   // steps/s during homing
+static constexpr float    PITCH_HOME_SPEED     = 700.0f;
 static constexpr float    ROLL_HOME_SPEED      = 700.0f;
-static constexpr float    PITCH_RUN_SPEED      = 1200.0f;  // steps/s during normal run
-static constexpr float    ROLL_RUN_SPEED       = 1200.0f;
+static constexpr float    JOG_SPEED            = 400.0f;
 static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
 static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 
-// ----------------------------------------------------------------
-// CAN timing
-// ----------------------------------------------------------------
-static constexpr uint8_t  CAN_NODE_ID                = config::NODE_ID_LEFT;
-static constexpr uint32_t CAN_TX_CONTROL_INTERVAL_MS = 20;   // 50 Hz
-static constexpr uint32_t CAN_TX_FAULT_INTERVAL_MS   = 500;  // 2 Hz
-static constexpr uint32_t CAN_TX_BMS_INTERVAL_MS     = 1000; // 1 Hz
-
-// ----------------------------------------------------------------
-// Drivers
-// ----------------------------------------------------------------
 static StepperDriver pitch({
     .pin_step       = PIN_PITCH_STEP,
     .pin_dir        = PIN_PITCH_DIR,
     .pin_en         = PIN_PITCH_ENA,
     .pin_flt        = PIN_PITCH_FLT,
     .step_pulse_us  = 5.0f,
-    .steps_per_sec  = PITCH_RUN_SPEED,
+    .steps_per_sec  = PITCH_HOME_SPEED,
     .flt_active_low = true,
     .en_active_low  = true
 });
@@ -62,229 +65,229 @@ static StepperDriver roll({
     .pin_en         = PIN_ROLL_ENA,
     .pin_flt        = PIN_ROLL_FLT,
     .step_pulse_us  = 5.0f,
-    .steps_per_sec  = ROLL_RUN_SPEED,
+    .steps_per_sec  = ROLL_HOME_SPEED,
     .flt_active_low = true,
     .en_active_low  = true
 });
 
-static PushSwitch pitchFwdLimit({ .pin = PIN_FWD_SWH,    .active_low = true, .use_pullup = true });
-static PushSwitch pitchRevLimit({ .pin = PIN_BWD_SWH,    .active_low = true, .use_pullup = true });
-static HallSensor rollHall     ({ .pin = PIN_HALL_SENS,  .active_low = true, .use_pullup = true });
-static LeakSensor leak(PIN_LEAK, true); // active HIGH
+static PushSwitch pitchFwdLimit({ .pin = PIN_FWD_SWH,   .active_low = true, .use_pullup = true });
+static PushSwitch pitchRevLimit({ .pin = PIN_BWD_SWH,   .active_low = true, .use_pullup = true });
+static HallSensor rollHall     ({ .pin = PIN_HALL_SENS, .active_low = true, .use_pullup = true });
 
-static CanBus canBus;
-static BmsUart bmsUart({ .serial = &Serial2, .baud = BMS_BAUD });
-static BmsManager bmsManager;
-static SafetyManager safety;
-static SafetyManager::Output lastSafety{};
+static int32_t pitchSteps = 0;
+static int32_t rollSteps  = 0;
+static bool    pitchHomed = false;
+static bool    rollHomed  = false;
+static bool    liveMode   = true;   // 1 Hz auto-print on by default
+static String  rx;
 
-// ----------------------------------------------------------------
-// Axis state
-// ----------------------------------------------------------------
-static int32_t pitchSteps        = 0;
-static int32_t rollSteps         = 0;
-static bool    pitchHomed        = false;
-static bool    rollHomed         = false;
-static bool    pitchHomingFailed = false;
-static bool    rollHomingFailed  = false;
-static bool    motorsEnabled     = false;
+static uint32_t lastLivePrint = 0;
 
 // ----------------------------------------------------------------
-// Control mode
-// ----------------------------------------------------------------
-enum class Mode { CAN, OVERRIDE, HOMING, NEUTRAL };
-static Mode mode            = Mode::CAN;
-static Mode homingReturnMode = Mode::CAN;
-
-// Pending setpoint (only applied when both axes homed)
-static float targetPitchMm      = 0.0f;
-static float targetRollDeg      = 0.0f;
-static bool  newSetpointPending = false;
-
-// ----------------------------------------------------------------
-// CAN timing / bookkeeping
-// ----------------------------------------------------------------
-static uint32_t lastCanRx     = 0;
-static bool     canRxEver     = false;
-static uint8_t  canSeqControl = 0;
-static uint8_t  canSeqFault   = 0;
-static uint8_t  canSeqBms     = 0;
-static uint32_t lastTxControl = 0;
-static uint32_t lastTxFault   = 0;
-static uint32_t lastTxBms     = 0;
-
-// CAN RX de-dup for debug printing (only print changed frames)
-struct FrameCache { bool valid; CanFrame frame; };
-static FrameCache lastFrames[2048];
-
-// ----------------------------------------------------------------
-// Serial
-// ----------------------------------------------------------------
-static String   cmdBuffer;
-static bool     debugPrint = false;
-static uint32_t lastPrint  = 0;
-
-// ----------------------------------------------------------------
-// LED heartbeat
-// ----------------------------------------------------------------
-static uint32_t lastLedToggle = 0;
-static bool     ledOn         = false;
-
-// ----------------------------------------------------------------
-// Fault injection flags
-// ----------------------------------------------------------------
-static bool inj_leak        = false;
-static bool inj_driver_p    = false;
-static bool inj_driver_r    = false;
-static bool inj_cmd_s       = false;  // soft cmd timeout
-static bool inj_cmd_h       = false;  // hard cmd timeout
-static bool inj_bms_to_s    = false;
-static bool inj_bms_to_h    = false;
-static bool inj_bms_temp    = false;
-static bool inj_bms_oc      = false;
-static bool inj_bms_sw      = false;
-static bool inj_bms_low     = false;
-static bool inj_bms_high    = false;
-static bool inj_home_fail_p = false;
-static bool inj_home_fail_r = false;
-
-// ================================================================
 // Helpers
-// ================================================================
-
+// ----------------------------------------------------------------
 static StepperDriver::Direction opposite(StepperDriver::Direction d) {
     return d == StepperDriver::Direction::CW
-        ? StepperDriver::Direction::CCW
-        : StepperDriver::Direction::CW;
+        ? StepperDriver::Direction::CCW : StepperDriver::Direction::CW;
 }
 
-static int32_t pitchMmToSteps(float mm) {
-    return static_cast<int32_t>(lroundf(mm / config::PITCH_STEP_MM));
-}
-static int32_t rollDegToSteps(float deg) {
-    return static_cast<int32_t>(lroundf(deg / config::ROLL_STEP_DEG));
-}
 static float pitchStepsToMm(int32_t s) { return s * config::PITCH_STEP_MM; }
 static float rollStepsToDeg(int32_t s) { return s * config::ROLL_STEP_DEG; }
-static uint32_t absI32(int32_t v) { return v >= 0 ? (uint32_t)v : (uint32_t)(-v); }
 
-// Returns true when a raw safety signal demands an immediate move abort.
-static bool shouldAbortMove() {
-    return (leak.isLeak() || inj_leak)
-        || pitch.faultActive()
-        || roll.faultActive();
+static uint32_t absI32(int32_t v) {
+    return v >= 0 ? (uint32_t)v : (uint32_t)(-v);
 }
 
-// Move pitch by |delta| steps in the correct direction; checks abort each step.
-// Updates pitchSteps as it goes. Returns false if aborted early.
-static bool movePitchDelta(int32_t delta) {
-    if (delta == 0) return true;
-    const bool fwd = delta > 0;
-    const uint32_t n = absI32(delta);
+// ----------------------------------------------------------------
+// Jog helpers
+// ----------------------------------------------------------------
+static void jogPitch(int32_t steps) {
+    if (steps == 0) return;
+    pitch.setSpeed(JOG_SPEED);
+    const bool fwd = steps > 0;
     pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
+    const uint32_t n = absI32(steps);
+    uint32_t moved = 0;
     for (uint32_t i = 0; i < n; i++) {
-        if (shouldAbortMove()) return false;
+        if (pitch.faultActive()) { Serial.println("[jog] ABORT pitch: driver fault"); break; }
+        if (fwd  && pitchFwdLimit.isPressed()) { Serial.println("[jog] STOP pitch: FWD limit hit"); break; }
+        if (!fwd && pitchRevLimit.isPressed()) { Serial.println("[jog] STOP pitch: BWD limit hit"); break; }
         pitch.step();
         pitchSteps += fwd ? 1 : -1;
+        moved++;
     }
-    return true;
+    Serial.print("[jog] pitch moved "); Serial.print(fwd ? "+" : "-");
+    Serial.print(moved); Serial.print(" steps  pos=");
+    Serial.print(pitchStepsToMm(pitchSteps), 3); Serial.println(" mm");
 }
 
-// Move roll by |delta| steps in the correct direction; checks abort each step.
-static bool moveRollDelta(int32_t delta) {
-    if (delta == 0) return true;
-    const bool cw = delta > 0;
-    const uint32_t n = absI32(delta);
+static void jogRoll(int32_t steps) {
+    if (steps == 0) return;
+    roll.setSpeed(JOG_SPEED);
+    const bool cw = steps > 0;
     roll.setDirection(cw ? ROLL_CW_DIR : opposite(ROLL_CW_DIR));
+    const uint32_t n = absI32(steps);
+    uint32_t moved = 0;
     for (uint32_t i = 0; i < n; i++) {
-        if (shouldAbortMove()) return false;
+        if (roll.faultActive()) { Serial.println("[jog] ABORT roll: driver fault"); break; }
         roll.step();
         rollSteps += cw ? 1 : -1;
+        moved++;
     }
-    return true;
+    Serial.print("[jog] roll moved "); Serial.print(cw ? "+" : "-");
+    Serial.print(moved); Serial.print(" steps  pos=");
+    Serial.print(rollStepsToDeg(rollSteps), 3); Serial.println(" deg");
 }
 
-static const char* modeName(Mode m) {
-    switch (m) {
-        case Mode::CAN:      return "CAN";
-        case Mode::OVERRIDE: return "OVERRIDE";
-        case Mode::HOMING:   return "HOMING";
-        case Mode::NEUTRAL:  return "NEUTRAL";
-    }
-    return "?";
+// ----------------------------------------------------------------
+// Sensor print (called at 1 Hz and on demand)
+// ----------------------------------------------------------------
+static void printSensors() {
+    Serial.print("[sensors]  FWD=");
+    Serial.print(pitchFwdLimit.isPressed() ? "PRESSED" : "open   ");
+    Serial.print("  BWD=");
+    Serial.print(pitchRevLimit.isPressed() ? "PRESSED" : "open   ");
+    Serial.print("  HALL=");
+    Serial.print(rollHall.isActive() ? "ACTIVE " : "inactive");
+    Serial.print("  flt_P=");
+    Serial.print(pitch.faultActive() ? "FAULT" : "ok");
+    Serial.print("  flt_R=");
+    Serial.println(roll.faultActive() ? "FAULT" : "ok");
 }
 
-static uint8_t mapSystemState() {
-    if (lastSafety.hard_fault)        return can::STATE_FAULT;
-    if (mode == Mode::HOMING)         return can::STATE_HOMING;
-    if (!pitchHomed || !rollHomed)    return can::STATE_UNHOMED;
-    if (mode == Mode::NEUTRAL)        return can::STATE_RUN;
-    return can::STATE_HOLD;
+static void printStatus() {
+    Serial.println();
+    Serial.print("homed_P="); Serial.print(pitchHomed ? "YES" : "NO");
+    Serial.print("  pitch="); Serial.print(pitchStepsToMm(pitchSteps), 3);
+    Serial.print(" mm  ("); Serial.print(pitchSteps); Serial.println(" steps)");
+
+    Serial.print("homed_R="); Serial.print(rollHomed ? "YES" : "NO");
+    Serial.print("  roll=");  Serial.print(rollStepsToDeg(rollSteps), 3);
+    Serial.print(" deg  ("); Serial.print(rollSteps); Serial.println(" steps)");
+
+    printSensors();
 }
 
-static bool parseFloatStrict(const String& text, float& out) {
-    String t = text;
-    t.trim();
-    if (t.length() == 0) return false;
-    char* end = nullptr;
-    out = strtof(t.c_str(), &end);
-    while (*end == ' ' || *end == '\t') end++;
-    return (*end == '\0') && isfinite(out);
+static void printHelp() {
+    Serial.println();
+    Serial.println("=== HOMING TEST ===");
+    Serial.println("sensors       : print sensor states once");
+    Serial.println("live on/off   : toggle 1 Hz auto sensor print");
+    Serial.println("--- Homing ---");
+    Serial.println("homep         : run pitch homing");
+    Serial.println("homer         : run roll homing");
+    Serial.println("home          : run pitch + roll homing");
+    Serial.println("status        : position + sensor snapshot");
+    Serial.println("--- Jog (N = step count) ---");
+    Serial.println("pf <N>        : pitch forward N steps  (stops at FWD limit)");
+    Serial.println("pb <N>        : pitch backward N steps (stops at BWD limit)");
+    Serial.println("rcw <N>       : roll CW N steps");
+    Serial.println("rccw <N>      : roll CCW N steps");
+    Serial.println("--- Motor enable ---");
+    Serial.println("pen / pdis    : enable / disable pitch driver");
+    Serial.println("ren / rdis    : enable / disable roll driver");
+    Serial.println("help          : this message");
+    Serial.println();
+    Serial.println("Tip: watch the 1 Hz line while manually pressing");
+    Serial.println("     the switches / moving the roll mechanism");
+    Serial.println("     to verify sensors read correctly BEFORE homing.");
+    Serial.println();
 }
 
-// ================================================================
-// Homing
-// ================================================================
-
+// ----------------------------------------------------------------
+// Pitch homing
+// ----------------------------------------------------------------
 static bool homePitch() {
-    Serial.println("Pitch homing start...");
-    pitchHomed        = false;
-    pitchHomingFailed = false;
+    Serial.println();
+    Serial.println(">>> PITCH HOMING START");
+    pitchHomed = false;
     bool ok = false;
 
-    const float savedSpeed = pitch.speed();
     pitch.setSpeed(PITCH_HOME_SPEED);
 
     do {
-        // Phase 1: seek forward limit
+        // ----------------------------------------------------------
+        // Phase 1: move FORWARD until FWD limit switch presses.
+        // ----------------------------------------------------------
+        Serial.println("[P1] seeking FWD limit switch...");
         pitch.setDirection(PITCH_FORWARD_DIR);
+
         uint32_t moved = 0;
         while (!pitchFwdLimit.isPressed() && moved < PITCH_HOME_MAX_STEPS) {
-            if (shouldAbortMove()) { Serial.println("Pitch abort: safety signal (fwd seek)"); break; }
+            if (pitch.faultActive()) {
+                Serial.println("[P1] ABORT: driver fault");
+                break;
+            }
             pitch.step();
             pitchSteps++;
             moved++;
         }
+
         if (!pitchFwdLimit.isPressed()) {
-            Serial.println("Pitch homing failed: FWD limit not reached");
+            Serial.print("[P1] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — FWD limit not reached");
             break;
         }
         const int32_t fwdHit = pitchSteps;
+        Serial.print("[P1] FWD limit hit at step "); Serial.println(fwdHit);
 
-        // Phase 2: seek reverse limit
+        // ----------------------------------------------------------
+        // Phase 2: move BACKWARD until BWD limit switch presses.
+        // ----------------------------------------------------------
+        Serial.println("[P2] seeking BWD limit switch...");
         pitch.setDirection(opposite(PITCH_FORWARD_DIR));
+
         moved = 0;
         while (!pitchRevLimit.isPressed() && moved < PITCH_HOME_MAX_STEPS) {
-            if (shouldAbortMove()) { Serial.println("Pitch abort: safety signal (rev seek)"); break; }
+            if (pitch.faultActive()) {
+                Serial.println("[P2] ABORT: driver fault");
+                break;
+            }
             pitch.step();
             pitchSteps--;
             moved++;
         }
+
         if (!pitchRevLimit.isPressed()) {
-            Serial.println("Pitch homing failed: REV limit not reached");
+            Serial.print("[P2] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — BWD limit not reached");
             break;
         }
         const int32_t revHit = pitchSteps;
+        Serial.print("[P2] BWD limit hit at step "); Serial.println(revHit);
 
         const int32_t span = fwdHit - revHit;
-        if (span <= 0) { Serial.println("Pitch homing failed: invalid span"); break; }
+        Serial.print("[P2] Span = "); Serial.print(span);
+        Serial.print(" steps = "); Serial.print(span * config::PITCH_STEP_MM, 2);
+        Serial.println(" mm");
 
-        // Phase 3: move to center and zero
-        const int32_t center = revHit + (span / 2);
-        if (!movePitchDelta(center - pitchSteps)) {
-            Serial.println("Pitch abort: safety signal (centering)");
+        if (span <= 0) {
+            Serial.println("[P2] FAILED: span invalid (FWD hit <= BWD hit)");
             break;
         }
+
+        // ----------------------------------------------------------
+        // Phase 3: move to center, zero the counter.
+        // ----------------------------------------------------------
+        const int32_t center = revHit + (span / 2);
+        const int32_t delta  = center - pitchSteps;
+        Serial.print("[P3] moving to center at step "); Serial.println(center);
+
+        if (delta != 0) {
+            const bool fwd = delta > 0;
+            pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
+            const uint32_t n = absI32(delta);
+            for (uint32_t i = 0; i < n; i++) {
+                if (pitch.faultActive()) {
+                    Serial.println("[P3] ABORT: driver fault while centering");
+                    break;
+                }
+                pitch.step();
+                pitchSteps += fwd ? 1 : -1;
+            }
+            if (pitch.faultActive()) break;
+        }
+
         pitchSteps = 0;
         pitch.setDirection(PITCH_FORWARD_DIR);
         pitchHomed = true;
@@ -292,65 +295,114 @@ static bool homePitch() {
 
     } while (false);
 
-    pitch.setSpeed(savedSpeed);
-
     if (ok) {
-        Serial.println("Pitch homing OK — centered and zeroed");
+        Serial.println(">>> PITCH HOMING OK — position zeroed at center");
     } else {
-        pitchHomingFailed = true;
-        Serial.println("Pitch homing FAILED");
+        Serial.println(">>> PITCH HOMING FAILED");
     }
     return ok;
 }
 
+// ----------------------------------------------------------------
+// Roll homing
+// ----------------------------------------------------------------
 static bool homeRoll() {
-    Serial.println("Roll homing start...");
-    rollHomed        = false;
-    rollHomingFailed = false;
+    Serial.println();
+    Serial.println(">>> ROLL HOMING START");
+    Serial.println("Assumes mechanism starts near centre (not on a magnet).");
+    rollHomed = false;
     bool ok = false;
 
-    const float savedSpeed = roll.speed();
     roll.setSpeed(ROLL_HOME_SPEED);
 
     do {
         uint32_t moved = 0;
 
-        // Phase 1: CCW until hall active — finds the -60 deg magnet
+        // ----------------------------------------------------------
+        // Phase 1: CCW until hall active — finds the -60 deg magnet.
+        // ----------------------------------------------------------
+        Serial.println("[R1] CCW seeking -60 magnet...");
         roll.setDirection(opposite(ROLL_CW_DIR));
+
         while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
-            if (shouldAbortMove()) { Serial.println("Roll abort: safety signal (CCW seek)"); break; }
+            if (roll.faultActive()) { Serial.println("[R1] ABORT: driver fault"); break; }
             roll.step();
             rollSteps--;
             moved++;
         }
-        if (!rollHall.isActive()) { Serial.println("Roll homing failed: -60 magnet not found"); break; }
-        const int32_t limitCCW = rollSteps;
 
-        // Phase 2: CW — exit the -60 magnet, sweep to the +60 magnet
-        roll.setDirection(ROLL_CW_DIR);
-        moved = 0;
-        while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
-            if (shouldAbortMove()) { Serial.println("Roll abort: safety signal (CW exit)"); break; }
-            roll.step();
-            rollSteps++;
-            moved++;
-        }
-        if (rollHall.isActive()) { Serial.println("Roll homing failed: could not exit -60 magnet"); break; }
-        while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
-            if (shouldAbortMove()) { Serial.println("Roll abort: safety signal (CW seek)"); break; }
-            roll.step();
-            rollSteps++;
-            moved++;
-        }
-        if (!rollHall.isActive()) { Serial.println("Roll homing failed: +60 magnet not found"); break; }
-        const int32_t limitCW = rollSteps;
-
-        // Phase 3: move to midpoint between the two magnets and zero
-        const int32_t center = (limitCCW + limitCW) / 2;
-        if (!moveRollDelta(center - rollSteps)) {
-            Serial.println("Roll abort: safety signal (centering)");
+        if (!rollHall.isActive()) {
+            Serial.print("[R1] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — -60 magnet not found");
             break;
         }
+        const int32_t limitCCW = rollSteps;
+        Serial.print("[R1] -60 magnet found at step "); Serial.print(limitCCW);
+        Serial.print(" ("); Serial.print(limitCCW * config::ROLL_STEP_DEG, 2); Serial.println(" deg)");
+
+        // ----------------------------------------------------------
+        // Phase 2: CW — exit the -60 magnet, sweep to +60 magnet.
+        // ----------------------------------------------------------
+        Serial.println("[R2] CW — exiting -60 magnet then seeking +60 magnet...");
+        roll.setDirection(ROLL_CW_DIR);
+        moved = 0;
+
+        // exit the -60 magnet first
+        while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            if (roll.faultActive()) { Serial.println("[R2] ABORT: driver fault"); break; }
+            roll.step();
+            rollSteps++;
+            moved++;
+        }
+        if (rollHall.isActive()) {
+            Serial.println("[R2] FAILED: could not exit -60 magnet");
+            break;
+        }
+        Serial.println("[R2] Exited -60 magnet, continuing CW...");
+
+        // sweep CW to the +60 magnet
+        while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
+            if (roll.faultActive()) { Serial.println("[R2] ABORT: driver fault"); break; }
+            roll.step();
+            rollSteps++;
+            moved++;
+        }
+        if (!rollHall.isActive()) {
+            Serial.print("[R2] FAILED after "); Serial.print(moved);
+            Serial.println(" steps — +60 magnet not found");
+            break;
+        }
+        const int32_t limitCW = rollSteps;
+        Serial.print("[R2] +60 magnet found at step "); Serial.print(limitCW);
+        Serial.print(" ("); Serial.print(limitCW * config::ROLL_STEP_DEG, 2); Serial.println(" deg)");
+
+        const int32_t span = limitCW - limitCCW;
+        Serial.print("[R2] Span = "); Serial.print(span);
+        Serial.print(" steps = "); Serial.print(span * config::ROLL_STEP_DEG, 2);
+        Serial.println(" deg  (expect ~120)");
+
+        // ----------------------------------------------------------
+        // Phase 3: move to midpoint between the two magnets, zero.
+        // ----------------------------------------------------------
+        const int32_t center = (limitCCW + limitCW) / 2;
+        const int32_t delta  = center - rollSteps;
+        Serial.print("[R3] Moving to midpoint step "); Serial.println(center);
+
+        if (delta != 0) {
+            const bool cw = delta > 0;
+            roll.setDirection(cw ? ROLL_CW_DIR : opposite(ROLL_CW_DIR));
+            const uint32_t n = absI32(delta);
+            for (uint32_t i = 0; i < n; i++) {
+                if (roll.faultActive()) {
+                    Serial.println("[R3] ABORT: driver fault while centering");
+                    break;
+                }
+                roll.step();
+                rollSteps += cw ? 1 : -1;
+            }
+            if (roll.faultActive()) break;
+        }
+
         rollSteps = 0;
         roll.setDirection(ROLL_CW_DIR);
         rollHomed = true;
@@ -358,640 +410,119 @@ static bool homeRoll() {
 
     } while (false);
 
-    roll.setSpeed(savedSpeed);
-
     if (ok) {
-        Serial.println("Roll homing OK — centered and zeroed");
+        Serial.println(">>> ROLL HOMING OK — midpoint between magnets zeroed");
     } else {
-        rollHomingFailed = true;
-        Serial.println("Roll homing FAILED");
+        Serial.println(">>> ROLL HOMING FAILED");
     }
     return ok;
 }
 
-// Run both homing sequences (called from the HOMING mode dispatch).
-static void runHoming() {
-    const bool p = homePitch();
-    const bool r = homeRoll();
-    Serial.print("Homing complete: pitch=");
-    Serial.print(p ? "OK" : "FAIL");
-    Serial.print("  roll=");
-    Serial.println(r ? "OK" : "FAIL");
-
-    if (p && r) {
-        targetPitchMm = 0.0f;
-        targetRollDeg = 0.0f;
-    }
-    mode = homingReturnMode;
-}
-
-// ================================================================
-// Setpoint execution
-// ================================================================
-
-// Move both axes to the requested absolute position.
-// Clamps to configured limits; aborts on raw safety signals.
-static void executeSetpoint(float pitchMm, float rollDeg) {
-    if (!pitchHomed || !rollHomed) return;
-
-    const float pClamped = constrain(pitchMm, config::PITCH_MIN_MM, config::PITCH_MAX_MM);
-    const float rClamped = constrain(rollDeg, config::ROLL_MIN_DEG, config::ROLL_MAX_DEG);
-
-    const int32_t pDelta = pitchMmToSteps(pClamped) - pitchSteps;
-    const int32_t rDelta = rollDegToSteps(rClamped)  - rollSteps;
-
-    if (pDelta != 0) {
-        pitch.setSpeed(PITCH_RUN_SPEED);
-        movePitchDelta(pDelta);
-    }
-    if (rDelta != 0) {
-        roll.setSpeed(ROLL_RUN_SPEED);
-        moveRollDelta(rDelta);
-    }
-}
-
-// ================================================================
-// CAN TX
-// ================================================================
-
-static bool isFrameDifferentIgnoreSeq(const CanFrame& a, const CanFrame& b, uint8_t seqIdx) {
-    if (a.id != b.id || a.len != b.len) return true;
-    for (uint8_t i = 0; i < a.len; i++) {
-        if (i == seqIdx) continue;
-        if (a.data[i] != b.data[i]) return true;
-    }
-    return false;
-}
-
-static void sendStatusControl() {
-    can::StatusControl msg{};
-    msg.pitch_pos_01mm   = (int16_t)constrain((int)roundf(pitchStepsToMm(pitchSteps) * 10.0f), -32768, 32767);
-    msg.roll_angle_01deg = (int16_t)constrain((int)roundf(rollStepsToDeg(rollSteps)  * 10.0f), -32768, 32767);
-
-    uint8_t fa = 0;
-    if (pitchHomed)    fa |= can::FLAG_HOMED_P;
-    if (rollHomed)     fa |= can::FLAG_HOMED_R;
-    if (motorsEnabled) fa |= can::FLAG_ENABLE_P | can::FLAG_ENABLE_R;
-    msg.flagsA = fa;
-
-    uint8_t fb = 0;
-    if (pitchFwdLimit.isPressed())    fb |= can::FLAG_LIM_F;
-    if (pitchRevLimit.isPressed())    fb |= can::FLAG_LIM_R;
-    if (leak.isLeak() || inj_leak)   fb |= can::FLAG_LEAK;
-    if (rollHall.isActive())          fb |= can::FLAG_HALL;
-    msg.flagsB = fb;
-
-    msg.sequence = canSeqControl++;
-    msg.tof_mm   = 0;
-
-    uint8_t buf[8];
-    can::packStatusControl(buf, msg);
-    CanFrame frame;
-    frame.id  = can::STATUS_CONTROL_BASE + CAN_NODE_ID;
-    frame.len = 8;
-    for (int i = 0; i < 8; i++) frame.data[i] = buf[i];
-    canBus.write(frame);
-}
-
-static void sendStatusFault() {
-    can::StatusFault msg{};
-    msg.hard_fault_a     = lastSafety.hard_fault_a;
-    msg.hard_fault_b     = lastSafety.hard_fault_b;
-    msg.soft_fault       = lastSafety.soft_fault_bits;
-    msg.first_hard_fault = lastSafety.first_hard_fault;
-    msg.state            = mapSystemState();
-    msg.sequence         = canSeqFault++;
-
-    uint8_t buf[8];
-    can::packStatusFault(buf, msg);
-    CanFrame frame;
-    frame.id  = can::STATUS_FAULT_BASE + CAN_NODE_ID;
-    frame.len = 8;
-    for (int i = 0; i < 8; i++) frame.data[i] = buf[i];
-    canBus.write(frame);
-}
-
-static void sendStatusBms() {
-    const BmsManager::Telemetry& tel = bmsManager.telemetry();
-    can::StatusBMS msg{};
-    msg.pack_mV      = (uint16_t)constrain((int)roundf(tel.pack_voltage_v * 1000.0f), 0, 65535);
-    msg.pack_temp    = (int16_t)constrain(tel.pack_temp_dC / 10, -32768, 32767);
-    msg.bms_fault_id = tel.last_event_id;
-    msg.sequence     = canSeqBms++;
-
-    uint8_t buf[8];
-    can::packStatusBMS(buf, msg);
-    CanFrame frame;
-    frame.id  = can::STATUS_BMS_BASE + CAN_NODE_ID;
-    frame.len = 8;
-    for (int i = 0; i < 8; i++) frame.data[i] = buf[i];
-    canBus.write(frame);
-}
-
-// ================================================================
-// CAN RX
-// ================================================================
-
-static void handleCan() {
-    CanFrame frame;
-    while (canBus.read(frame)) {
-        const uint16_t id = frame.id & 0x7FF;
-
-        if (debugPrint) {
-            constexpr uint8_t SEQ_IDX = 6;
-            if (!lastFrames[id].valid ||
-                isFrameDifferentIgnoreSeq(frame, lastFrames[id].frame, SEQ_IDX)) {
-                Serial.print("RX id=0x"); Serial.print(frame.id, HEX);
-                Serial.print(" len=");    Serial.print(frame.len);
-                Serial.print(" data=");
-                for (uint8_t i = 0; i < frame.len; i++) {
-                    Serial.print(frame.data[i]); Serial.print(" ");
-                }
-                Serial.println();
-                lastFrames[id].frame = frame;
-                lastFrames[id].valid = true;
-            }
-        }
-
-        if (id != can::CMD_SETPOINT_BASE + CAN_NODE_ID) continue;
-
-        lastCanRx = millis();
-        canRxEver = true;
-
-        can::CmdSetpoint cmd;
-        can::unpackCmdSetpoint(frame.data, cmd);
-
-        // Homing command (only if both axes not yet homed and not already homing)
-        if ((cmd.command_mode & can::CMD_START_HOMING) &&
-            !pitchHomed && !rollHomed &&
-            mode != Mode::HOMING) {
-            homingReturnMode = Mode::CAN;
-            mode = Mode::HOMING;
-            Serial.println("CAN: homing triggered");
-            return;
-        }
-
-        // Reconnect from NEUTRAL if Pi comes back
-        if (mode == Mode::NEUTRAL) {
-            mode = Mode::CAN;
-            Serial.println("CAN reconnected — resuming CAN mode");
-        }
-
-        if (mode != Mode::CAN) continue;
-        if (!pitchHomed || !rollHomed) continue;
-
-        const float pMm  = cmd.pitch_travel_01mm  * 0.1f;
-        const float rDeg = cmd.roll_angle_01deg * 0.1f;
-
-        static int16_t lastPitchRaw = INT16_MIN;
-        static int16_t lastRollRaw  = INT16_MIN;
-
-        if (cmd.pitch_travel_01mm != lastPitchRaw || cmd.roll_angle_01deg != lastRollRaw) {
-            targetPitchMm      = pMm;
-            targetRollDeg      = rDeg;
-            newSetpointPending = true;
-            lastPitchRaw       = cmd.pitch_travel_01mm;
-            lastRollRaw        = cmd.roll_angle_01deg;
-        }
-    }
-}
-
-// ================================================================
-// Serial CLI
-// ================================================================
-
-static void clearInjections() {
-    inj_leak = inj_driver_p = inj_driver_r = false;
-    inj_cmd_s = inj_cmd_h = false;
-    inj_bms_to_s = inj_bms_to_h = false;
-    inj_bms_temp = inj_bms_oc = inj_bms_sw = false;
-    inj_bms_low = inj_bms_high = false;
-    inj_home_fail_p = inj_home_fail_r = false;
-}
-
-static void printInjections() {
-    Serial.print("INJ leak=");     Serial.print(inj_leak ? 1 : 0);
-    Serial.print(" drvP=");        Serial.print(inj_driver_p ? 1 : 0);
-    Serial.print(" drvR=");        Serial.print(inj_driver_r ? 1 : 0);
-    Serial.print(" scmd=");        Serial.print(inj_cmd_s ? 1 : 0);
-    Serial.print(" hcmd=");        Serial.print(inj_cmd_h ? 1 : 0);
-    Serial.print(" sbto=");        Serial.print(inj_bms_to_s ? 1 : 0);
-    Serial.print(" hbto=");        Serial.print(inj_bms_to_h ? 1 : 0);
-    Serial.print(" btemp=");       Serial.print(inj_bms_temp ? 1 : 0);
-    Serial.print(" boc=");         Serial.print(inj_bms_oc ? 1 : 0);
-    Serial.print(" bsw=");         Serial.print(inj_bms_sw ? 1 : 0);
-    Serial.print(" blow=");        Serial.print(inj_bms_low ? 1 : 0);
-    Serial.print(" bhigh=");       Serial.print(inj_bms_high ? 1 : 0);
-    Serial.print(" hfailP=");      Serial.print(inj_home_fail_p ? 1 : 0);
-    Serial.print(" hfailR=");      Serial.println(inj_home_fail_r ? 1 : 0);
-}
-
-static void printHelp() {
-    Serial.println("\n=== P&R Commands ===");
-    Serial.println("-- Always available --");
-    Serial.println("auto              -> enter OVERRIDE (serial control)");
-    Serial.println("debug t/f         -> enable / disable periodic status print");
-    Serial.println("status            -> print status once");
-    Serial.println("help              -> this message");
-    Serial.println("-- OVERRIDE mode --");
-    Serial.println("home              -> home both axes");
-    Serial.println("homep             -> home pitch only");
-    Serial.println("homer             -> home roll only");
-    Serial.println("en  / dis         -> enable / disable motors");
-    Serial.println("ap <mm>           -> pitch absolute move (mm)");
-    Serial.println("ar <deg>          -> roll absolute move (deg)");
-    Serial.println("goto <mm> <deg>   -> pitch + roll absolute");
-    Serial.println("c                 -> back to CAN mode (requires homed)");
-    Serial.println("recover           -> clear latched safety faults");
-    Serial.println("inj               -> print fault injections");
-    Serial.println("inj0              -> clear all fault injections");
-    Serial.println("-- Hard fault injections --");
-    Serial.println("leak1/0  drvp1/0  drvr1/0  hcmd1/0  hbto1/0");
-    Serial.println("btemp1/0  boc1/0  bsw1/0  hfailp1/0  hfailr1/0");
-    Serial.println("-- Soft fault injections --");
-    Serial.println("scmd1/0  sbto1/0  blow1/0  bhigh1/0");
-    Serial.println();
-}
-
-static void printStatus() {
-    Serial.println();
-    Serial.print("mode=");       Serial.print(modeName(mode));
-    Serial.print("  motors=");   Serial.print(motorsEnabled ? "EN" : "DIS");
-    Serial.print("  homed_P=");  Serial.print(pitchHomed ? "Y" : "N");
-    Serial.print("  homed_R=");  Serial.println(rollHomed ? "Y" : "N");
-
-    Serial.print("pitch=");      Serial.print(pitchStepsToMm(pitchSteps), 3);
-    Serial.print("mm  tgt=");    Serial.print(targetPitchMm, 2);
-    Serial.print("mm  lim_F=");  Serial.print(pitchFwdLimit.isPressed() ? "PRESSED" : "open");
-    Serial.print("  lim_R=");    Serial.print(pitchRevLimit.isPressed() ? "PRESSED" : "open");
-    Serial.print("  flt_P=");    Serial.println(pitch.faultActive() ? "Y" : "N");
-
-    Serial.print("roll=");       Serial.print(rollStepsToDeg(rollSteps), 3);
-    Serial.print("deg  tgt=");   Serial.print(targetRollDeg, 2);
-    Serial.print("deg  hall=");  Serial.print(rollHall.isActive() ? "ACTIVE" : "inactive");
-    Serial.print("  flt_R=");    Serial.println(roll.faultActive() ? "Y" : "N");
-
-    Serial.print("leak=");       Serial.print(leak.isLeak() ? "Y" : "N");
-    Serial.print("  HF_A=0x");   Serial.print(lastSafety.hard_fault_a, HEX);
-    Serial.print("  HF_B=0x");   Serial.print(lastSafety.hard_fault_b, HEX);
-    Serial.print("  SF=0x");     Serial.print(lastSafety.soft_fault_bits, HEX);
-    Serial.print("  first=");    Serial.println(lastSafety.first_hard_fault);
-
-    const BmsManager::Telemetry& tel = bmsManager.telemetry();
-    Serial.print("BMS V=");      Serial.print(tel.pack_voltage_v, 2);
-    Serial.print("V  T=");       Serial.print(tel.pack_temp_dC / 10.0f, 1);
-    Serial.print("C  snap=");    Serial.println(tel.full_snapshot_ready ? "Y" : "N");
-}
-
+// ----------------------------------------------------------------
+// Serial command handler
+// ----------------------------------------------------------------
 static void handleCommand(String cmd) {
     cmd.trim();
     cmd.toLowerCase();
     if (cmd.length() == 0) return;
 
-    // ---- Always available ----
-    if (cmd == "help")    { printHelp();  return; }
-    if (cmd == "status")  { printStatus(); return; }
-    if (cmd == "debug t") { debugPrint = true;  Serial.println("Debug ON");  return; }
-    if (cmd == "debug f") { debugPrint = false; Serial.println("Debug OFF"); return; }
+    if (cmd == "help")     { printHelp(); return; }
+    if (cmd == "status")   { printStatus(); return; }
+    if (cmd == "sensors")  { printSensors(); return; }
+    if (cmd == "live on")  { liveMode = true;  Serial.println("Live print ON");  return; }
+    if (cmd == "live off") { liveMode = false; Serial.println("Live print OFF"); return; }
 
-    if (cmd == "auto") {
-        if (mode == Mode::HOMING) {
-            Serial.println("Cannot override during homing");
-            return;
-        }
-        mode = Mode::OVERRIDE;
-        Serial.println("OVERRIDE mode — 'help' for commands");
+    if (cmd == "homep") {
+        homePitch();
+        printStatus();
         return;
     }
-
-    // ---- OVERRIDE only ----
-    if (mode != Mode::OVERRIDE) {
-        Serial.println("Not in OVERRIDE — send 'auto' first");
+    if (cmd == "homer") {
+        homeRoll();
+        printStatus();
         return;
     }
-
-    if (cmd == "en") {
-        if (!lastSafety.hard_fault) {
-            pitch.enable(); roll.enable(); motorsEnabled = true;
-            Serial.println("Motors enabled");
-        } else {
-            Serial.println("Hard fault active — run 'recover' first");
-        }
-        return;
-    }
-
-    if (cmd == "dis") {
-        pitch.disable(); roll.disable(); motorsEnabled = false;
-        Serial.println("Motors disabled");
-        return;
-    }
-
-    if (cmd == "homep") { homePitch(); printStatus(); return; }
-    if (cmd == "homer") { homeRoll();  printStatus(); return; }
     if (cmd == "home") {
         bool p = homePitch();
         bool r = homeRoll();
-        Serial.print("Homing: pitch="); Serial.print(p ? "OK" : "FAIL");
+        Serial.print("Home summary: pitch="); Serial.print(p ? "OK" : "FAIL");
         Serial.print("  roll="); Serial.println(r ? "OK" : "FAIL");
-        if (p && r) { targetPitchMm = 0.0f; targetRollDeg = 0.0f; }
         printStatus();
         return;
     }
 
-    if (cmd.startsWith("ap")) {
-        if (!pitchHomed) { Serial.println("Pitch not homed"); return; }
-        float mm;
-        if (!parseFloatStrict(cmd.substring(2), mm)) { Serial.println("Bad value"); return; }
-        executeSetpoint(mm, rollStepsToDeg(rollSteps));
-        printStatus();
+    if (cmd == "pen")  { pitch.enable();  Serial.println("Pitch enabled");  return; }
+    if (cmd == "pdis") { pitch.disable(); Serial.println("Pitch disabled"); return; }
+    if (cmd == "ren")  { roll.enable();   Serial.println("Roll enabled");   return; }
+    if (cmd == "rdis") { roll.disable();  Serial.println("Roll disabled");  return; }
+
+    if (cmd.startsWith("pf ")) {
+        int32_t n = cmd.substring(3).toInt();
+        if (n <= 0) { Serial.println("Usage: pf <N>  (N > 0)"); return; }
+        jogPitch(n);
         return;
     }
-
-    if (cmd.startsWith("ar")) {
-        if (!rollHomed) { Serial.println("Roll not homed"); return; }
-        float deg;
-        if (!parseFloatStrict(cmd.substring(2), deg)) { Serial.println("Bad value"); return; }
-        executeSetpoint(pitchStepsToMm(pitchSteps), deg);
-        printStatus();
+    if (cmd.startsWith("pb ")) {
+        int32_t n = cmd.substring(3).toInt();
+        if (n <= 0) { Serial.println("Usage: pb <N>  (N > 0)"); return; }
+        jogPitch(-n);
         return;
     }
-
-    if (cmd.startsWith("goto")) {
-        if (!pitchHomed || !rollHomed) { Serial.println("Not homed"); return; }
-        String args = cmd.substring(4);
-        args.trim();
-        const int sep = args.indexOf(' ');
-        if (sep < 0) { Serial.println("Format: goto <mm> <deg>"); return; }
-        float mm, deg;
-        if (!parseFloatStrict(args.substring(0, sep), mm) ||
-            !parseFloatStrict(args.substring(sep + 1), deg)) {
-            Serial.println("Bad values");
-            return;
-        }
-        executeSetpoint(mm, deg);
-        printStatus();
+    if (cmd.startsWith("rcw ")) {
+        int32_t n = cmd.substring(4).toInt();
+        if (n <= 0) { Serial.println("Usage: rcw <N>  (N > 0)"); return; }
+        jogRoll(n);
         return;
     }
-
-    if (cmd == "c") {
-        if (!pitchHomed || !rollHomed) { Serial.println("Not homed"); return; }
-        mode = Mode::CAN;
-        lastCanRx = millis();
-        Serial.println("CAN mode");
+    if (cmd.startsWith("rccw ")) {
+        int32_t n = cmd.substring(5).toInt();
+        if (n <= 0) { Serial.println("Usage: rccw <N>  (N > 0)"); return; }
+        jogRoll(-n);
         return;
     }
-
-    if (cmd == "recover") {
-        safety.reset();
-        lastSafety        = {};
-        pitchHomingFailed = false;
-        rollHomingFailed  = false;
-        Serial.println("Safety reset");
-        return;
-    }
-
-    if (cmd == "inj0") { clearInjections(); Serial.println("Injections cleared"); return; }
-    if (cmd == "inj")  { printInjections(); return; }
-
-    // Hard fault injections
-    if (cmd == "leak1")   { inj_leak = true;        return; }
-    if (cmd == "leak0")   { inj_leak = false;       return; }
-    if (cmd == "drvp1")   { inj_driver_p = true;    return; }
-    if (cmd == "drvp0")   { inj_driver_p = false;   return; }
-    if (cmd == "drvr1")   { inj_driver_r = true;    return; }
-    if (cmd == "drvr0")   { inj_driver_r = false;   return; }
-    if (cmd == "hcmd1")   { inj_cmd_h = true;       return; }
-    if (cmd == "hcmd0")   { inj_cmd_h = false;      return; }
-    if (cmd == "hbto1")   { inj_bms_to_h = true;    return; }
-    if (cmd == "hbto0")   { inj_bms_to_h = false;   return; }
-    if (cmd == "btemp1")  { inj_bms_temp = true;    return; }
-    if (cmd == "btemp0")  { inj_bms_temp = false;   return; }
-    if (cmd == "boc1")    { inj_bms_oc = true;      return; }
-    if (cmd == "boc0")    { inj_bms_oc = false;     return; }
-    if (cmd == "bsw1")    { inj_bms_sw = true;      return; }
-    if (cmd == "bsw0")    { inj_bms_sw = false;     return; }
-    if (cmd == "hfailp1") { inj_home_fail_p = true; return; }
-    if (cmd == "hfailp0") { inj_home_fail_p = false;return; }
-    if (cmd == "hfailr1") { inj_home_fail_r = true; return; }
-    if (cmd == "hfailr0") { inj_home_fail_r = false;return; }
-
-    // Soft fault injections
-    if (cmd == "scmd1")  { inj_cmd_s = true;      return; }
-    if (cmd == "scmd0")  { inj_cmd_s = false;     return; }
-    if (cmd == "sbto1")  { inj_bms_to_s = true;   return; }
-    if (cmd == "sbto0")  { inj_bms_to_s = false;  return; }
-    if (cmd == "blow1")  { inj_bms_low = true;    return; }
-    if (cmd == "blow0")  { inj_bms_low = false;   return; }
-    if (cmd == "bhigh1") { inj_bms_high = true;   return; }
-    if (cmd == "bhigh0") { inj_bms_high = false;  return; }
 
     Serial.print("Unknown: "); Serial.println(cmd);
 }
 
 static void readSerial() {
     while (Serial.available()) {
-        const char c = (char)Serial.read();
+        char c = (char)Serial.read();
         if (c == '\r' || c == '\n') {
-            if (cmdBuffer.length() > 0) {
-                handleCommand(cmdBuffer);
-                cmdBuffer = "";
-            }
-        } else if (cmdBuffer.length() < 64) {
-            cmdBuffer += c;
+            if (rx.length() > 0) { handleCommand(rx); rx = ""; }
         } else {
-            cmdBuffer = "";
-            Serial.println("ERROR: command too long");
+            rx += c;
         }
     }
 }
 
-// ================================================================
-// Setup
-// ================================================================
-
+// ----------------------------------------------------------------
+// Setup / Loop
+// ----------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
-    logger::begin(115200);
-    cmdBuffer.reserve(64);
-
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
+    delay(1000);
 
     pitch.begin();
     roll.begin();
     pitchFwdLimit.begin();
     pitchRevLimit.begin();
     rollHall.begin();
-    leak.begin(false);
 
-    pitch.setSpeed(PITCH_RUN_SPEED);
-    roll.setSpeed(ROLL_RUN_SPEED);
     pitch.enable();
     roll.enable();
-    motorsEnabled = true;
 
-    bmsUart.begin();
-    bmsManager.configure({
-        .transport           = &bmsUart,
-        .poll_interval_ms    = 100,
-        .response_timeout_ms = 120,
-        .max_retries         = 1,
-        .fault_confirm_ms    = 2000,
-        .timeout_small_ms    = config::BMS_TIMEOUT_SMALL_MS,
-        .timeout_large_ms    = config::BMS_TIMEOUT_LARGE_MS
-    });
-    bmsManager.begin();
-
-    safety.configure({});
-    safety.reset();
-
-    canBus.begin(500000, PIN_CAN_R, PIN_CAN_D);
-
-    Serial.println("P&R ready — CAN mode.");
-    Serial.println("Send CMD_START_HOMING via CAN or type 'auto' for serial control.");
     printHelp();
+    Serial.println("Live sensor readings active (1 Hz). Manually trigger");
+    Serial.println("each sensor now to confirm they read correctly.");
+    Serial.println("Then type 'homep', 'homer', or 'home' to test homing.");
+    Serial.println();
 }
 
-// ================================================================
-// Loop
-// ================================================================
-
 void loop() {
-    const uint32_t now = millis();
-
-    // LED heartbeat: 100 ms pulse every 5 s
-    if (!ledOn && now - lastLedToggle >= 5000) {
-        digitalWrite(LED_BUILTIN, HIGH); ledOn = true; lastLedToggle = now;
-    }
-    if (ledOn && now - lastLedToggle >= 100) {
-        digitalWrite(LED_BUILTIN, LOW); ledOn = false;
-    }
-
-    // dt
-    static uint32_t lastTime = 0;
-    const float dt = lastTime ? (now - lastTime) * 1e-3f : 0.0f;
-    lastTime = now;
-
-    // BMS transport + manager (non-blocking)
-    bmsUart.update();
-    bmsManager.update(now);
-
-    // Serial + CAN inputs
     readSerial();
-    handleCan();
 
-    // CAN large timeout → move to neutral position
-    if (mode == Mode::CAN && canRxEver &&
-        (now - lastCanRx > config::CMD_TIMEOUT_LARGE_MS)) {
-        mode = Mode::NEUTRAL;
-        newSetpointPending = false;
-        Serial.println("!! CAN timeout — moving to neutral (pitch=0 roll=0)");
-    }
-
-    // ----------------------------------------------------------------
-    // Mode dispatch (blocking moves happen here)
-    // ----------------------------------------------------------------
-    if (mode == Mode::HOMING) {
-        runHoming();
-
-    } else if (mode == Mode::NEUTRAL) {
-        // Move to pitch=0, roll=0 if not already there
-        if (pitchHomed && rollHomed) {
-            const float curP = pitchStepsToMm(pitchSteps);
-            const float curR = rollStepsToDeg(rollSteps);
-            if (fabsf(curP) > 0.1f || fabsf(curR) > 0.5f) {
-                executeSetpoint(0.0f, 0.0f);
-                Serial.println("NEUTRAL: reached pitch=0 roll=0");
-            }
-        }
-
-    } else if (newSetpointPending && (mode == Mode::CAN || mode == Mode::OVERRIDE)) {
-        if (pitchHomed && rollHomed && !lastSafety.hard_fault) {
-            newSetpointPending = false;
-            executeSetpoint(targetPitchMm, targetRollDeg);
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // Safety update (re-read millis after any blocking move)
-    // ----------------------------------------------------------------
-    {
-        const uint32_t now2 = millis();
-        const bool inCanFamily   = (mode == Mode::CAN || mode == Mode::NEUTRAL);
-        const bool cmdSmall      = inCanFamily && canRxEver && (now2 - lastCanRx > config::CMD_TIMEOUT_SMALL_MS);
-        const bool cmdLarge      = (mode == Mode::NEUTRAL) ||
-                                   (mode == Mode::CAN && canRxEver &&
-                                    (now2 - lastCanRx > config::CMD_TIMEOUT_LARGE_MS));
-
-        const bool bmsEverSeen   = bmsManager.telemetry().any_response;
-        const BmsManager::Flags& bmsF = bmsManager.flags();
-
-        SafetyManager::Inputs sin{};
-        sin.leak_raw               = leak.isLeak()       || inj_leak;
-        sin.driver_fault_pitch_raw = pitch.faultActive() || inj_driver_p;
-        sin.driver_fault_roll_raw  = roll.faultActive()  || inj_driver_r;
-        sin.homing_failed_pitch    = pitchHomingFailed   || inj_home_fail_p;
-        sin.homing_failed_roll     = rollHomingFailed    || inj_home_fail_r;
-        sin.stall_pitch_raw        = false;   // no current sensing on steppers
-        sin.stall_roll_raw         = false;
-        sin.cmd_timeout_small      = cmdSmall                                     || inj_cmd_s;
-        sin.cmd_timeout_large      = cmdLarge                                     || inj_cmd_h;
-        sin.bms_timeout_small      = (bmsEverSeen && bmsF.bms_timeout_small)      || inj_bms_to_s;
-        sin.bms_timeout_large      = (bmsEverSeen && bmsF.bms_timeout_large)      || inj_bms_to_h;
-        sin.bms_temp_high          = (bmsEverSeen && bmsF.bms_temp_high)          || inj_bms_temp;
-        sin.bms_overcurrent        = (bmsEverSeen && bmsF.bms_overcurrent)        || inj_bms_oc;
-        sin.bms_switch_fault       = (bmsEverSeen && bmsF.bms_switch_fault)       || inj_bms_sw;
-        sin.bms_low_voltage        = (bmsEverSeen && bmsF.bms_low_voltage)        || inj_bms_low;
-        sin.bms_high_voltage       = (bmsEverSeen && bmsF.bms_high_voltage)       || inj_bms_high;
-        sin.tof_valid              = true;   // ToF not used
-
-        lastSafety = safety.update(sin, dt);
-    }
-
-    // ----------------------------------------------------------------
-    // Motor enable/disable response to faults
-    // Allow motors in NEUTRAL even if the only fault is CMD_TO_L,
-    // so the neutral move can complete.
-    // ----------------------------------------------------------------
-    {
-        const bool onlyCmdTo = (lastSafety.hard_fault_a == can::FAULT_CMD_TO_L) &&
-                               (lastSafety.hard_fault_b == 0);
-        const bool suppress  = (mode == Mode::NEUTRAL) && onlyCmdTo;
-
-        if (lastSafety.hard_fault && !suppress) {
-            if (motorsEnabled) {
-                pitch.disable();
-                roll.disable();
-                motorsEnabled = false;
-            }
-        } else if (!motorsEnabled) {
-            pitch.enable();
-            roll.enable();
-            motorsEnabled = true;
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // CAN TX
-    // ----------------------------------------------------------------
-    if (now - lastTxControl >= CAN_TX_CONTROL_INTERVAL_MS) {
-        lastTxControl = now;
-        sendStatusControl();
-    }
-    if (now - lastTxFault >= CAN_TX_FAULT_INTERVAL_MS) {
-        lastTxFault = now;
-        sendStatusFault();
-    }
-    if (now - lastTxBms >= CAN_TX_BMS_INTERVAL_MS) {
-        lastTxBms = now;
-        sendStatusBms();
-    }
-
-    // ----------------------------------------------------------------
-    // Debug print
-    // ----------------------------------------------------------------
-    if (debugPrint && now - lastPrint >= 2000) {
-        lastPrint = now;
-        printStatus();
+    if (liveMode && millis() - lastLivePrint >= 1000) {
+        lastLivePrint = millis();
+        printSensors();
     }
 }
