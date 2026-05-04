@@ -3,7 +3,7 @@
 #include <cmath>
 #include <cstring>
 
-constexpr uint8_t BmsManager::kPollCommands[7];
+constexpr uint8_t BmsManager::kPollCommands[8];
 
 BmsManager::BmsManager()
 {
@@ -184,7 +184,8 @@ void BmsManager::parseRx(uint32_t now_ms)
                    type == CMD_READ_ONLINE_STATUS) {
             frame_len = 6;
         } else if (type == CMD_READ_TEMPERATURES ||
-                   type == CMD_READ_NEWEST_EVENTS) {
+                   type == CMD_READ_NEWEST_EVENTS ||
+                   type == CMD_READ_CELLS_VOLTAGE) {
             if (rx_len_ < 3) {
                 break;
             }
@@ -316,6 +317,23 @@ void BmsManager::handleFrame(const uint8_t* frame, uint16_t len, uint32_t now_ms
         }
         completePending(type);
         break;
+
+    case CMD_READ_CELLS_VOLTAGE: {
+        // [AA, 1C, PL, cell1_L, cell1_H, ..., CRC_L, CRC_H]
+        // Each cell is UINT16, resolution 0.1 mV → divide by 10 to get mV.
+        if (len >= 5) {
+            const uint8_t pl = frame[2];
+            const uint8_t n  = static_cast<uint8_t>(pl / 2);
+            telemetry_.num_cells = (n > 16) ? 16 : n;
+            for (uint8_t i = 0; i < telemetry_.num_cells; i++) {
+                const uint16_t raw_01mv = readU16LE(&frame[3 + i * 2u]);
+                telemetry_.cell_mv[i]   = static_cast<uint16_t>(raw_01mv / 10u);
+            }
+            markSnapshotBit(type, now_ms);
+        }
+        completePending(type);
+        break;
+    }
 
     default:
         break;
@@ -539,7 +557,8 @@ void BmsManager::markSnapshotBit(uint8_t cmd, uint32_t now_ms)
     case CMD_READ_MIN_CELL:      snapshot_mask_ |= SNAP_MIN_CELL; break;
     case CMD_READ_ONLINE_STATUS: snapshot_mask_ |= SNAP_STATUS; break;
     case CMD_READ_TEMPERATURES:  snapshot_mask_ |= SNAP_TEMPS; break;
-    case CMD_READ_NEWEST_EVENTS: snapshot_mask_ |= SNAP_EVENTS; break;
+    case CMD_READ_NEWEST_EVENTS:  snapshot_mask_ |= SNAP_EVENTS; break;
+    case CMD_READ_CELLS_VOLTAGE:  snapshot_mask_ |= SNAP_CELLS;  break;
     default: break;
     }
 

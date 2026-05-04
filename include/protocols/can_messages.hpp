@@ -26,10 +26,11 @@ namespace can
    CAN BASE IDS
 ---------------------------------------------------------- */
 
-constexpr uint16_t STATUS_FAULT_BASE   = 0x053;
-constexpr uint16_t CMD_SETPOINT_BASE   = 0x103;
-constexpr uint16_t STATUS_CONTROL_BASE = 0x203;
-constexpr uint16_t STATUS_BMS_BASE     = 0x213;
+constexpr uint16_t STATUS_FAULT_BASE    = 0x053;
+constexpr uint16_t CMD_SETPOINT_BASE    = 0x103;
+constexpr uint16_t STATUS_CONTROL_BASE  = 0x203;
+constexpr uint16_t STATUS_BMS_BASE      = 0x213;
+constexpr uint16_t STATUS_BMS_MORE_BASE = 0x223;
 
 
 /* ----------------------------------------------------------
@@ -168,18 +169,46 @@ struct StatusControl
 };
 
 
+/*
+------------------------------------------------------------
+STATUS_BMS  (0x213)
+------------------------------------------------------------
+Encoding:
+  pack_V:       uint8  ×0.1 V       → decode: value / 10.0
+  min/max_cell: uint8  (mV−2500)/10 → decode: value * 10 + 2500
+  pack_current: int8   ×0.5 A       → decode: value * 0.5  (+ = discharge)
+  temp_*:       uint8  °C           → 0xFF = invalid / not connected
+------------------------------------------------------------
+*/
 struct StatusBMS
 {
-    uint16_t pack_mV;       // battery pack voltage (mV)
-    int16_t pack_temp;      // battery pack temperature (degC)
+    uint8_t pack_V;         // pack voltage ×0.1V  (e.g. 168 = 16.8 V)
+    uint8_t min_cell_V;     // (mV − 2500) / 10    (e.g.  81 = 3310 mV)
+    uint8_t max_cell_V;     // (mV − 2500) / 10    (e.g. 172 = 4220 mV)
+    int8_t  pack_current;   // ×0.5 A, + = discharge (e.g. −17 = −8.5 A charging)
+    uint8_t temp_internal;  // °C, 0xFF = invalid
+    uint8_t temp_ext1;      // °C, 0xFF = not connected
+    uint8_t temp_ext2;      // °C, 0xFF = not connected
+    uint8_t sequence;
+};
 
-    uint8_t bms_fault_id;   // raw fault ID reported by TinyBMS (see BMS datasheet table)
 
-    uint8_t reserved0;
-
-    uint8_t sequence;       // rolling counter
-
-    uint8_t reserved1;
+/*
+------------------------------------------------------------
+STATUS_BMS_MORE  (0x223)
+------------------------------------------------------------
+cell_V[0..5]: first 6 individual cell voltages from BMS cmd 0x1C.
+              Encoding: (mV − 2500) / 10, same as min/max_cell_V.
+              Unused slots (fewer than 6 cells) remain 0.
+online_status: 0=Unknown 1=Charging 2=FullyCharged
+               3=Discharging 4=Idle 5=Fault
+------------------------------------------------------------
+*/
+struct StatusBmsMore
+{
+    uint8_t cell_V[6];      // individual cells, same encoding as min/max_cell_V
+    uint8_t online_status;  // compact 0-5 enum (see above)
+    uint8_t sequence;
 };
 
 
@@ -191,6 +220,7 @@ void packStatusFault(uint8_t *buf, const StatusFault &msg);
 void packCmdSetpoint(uint8_t *buf, const CmdSetpoint &msg);
 void packStatusControl(uint8_t *buf, const StatusControl &msg);
 void packStatusBMS(uint8_t *buf, const StatusBMS &msg);
+void packStatusBmsMore(uint8_t *buf, const StatusBmsMore &msg);
 
 void unpackCmdSetpoint(const uint8_t *buf, CmdSetpoint &msg);
 
