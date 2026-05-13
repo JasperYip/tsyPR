@@ -48,7 +48,7 @@ constexpr uint32_t BMS_BAUD  = 115200;
 // Limit Switch 
 // =====================
 constexpr uint8_t PIN_FWD_SWH = 9;  // Fwd limit switch
-constexpr uint8_t PIN_BWD_SWH = 10;  // Bwd limit switch
+constexpr uint8_t PIN_BWD_SWH = 19;  // Bwd limit switch
 
 // =====================
 // Hall Effect Sensor
