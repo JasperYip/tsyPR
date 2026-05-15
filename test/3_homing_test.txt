@@ -26,25 +26,32 @@
 //   Expects ~120 deg span between the two magnets.
 //
 // Commands:
-//   sensors       print sensor states once
-//   live on/off   toggle 1 Hz auto-print
+//   sensors           print sensor states once
+//   live on/off       toggle 1 Hz auto-print
 //   homep/homer/home  run homing sequences
-//   pf <N>        pitch forward N steps (FWD-limit protected)
-//   pb <N>        pitch backward N steps (BWD-limit protected)
-//   rcw <N>       roll CW N steps
-//   rccw <N>      roll CCW N steps
-//   pen/pdis      enable / disable pitch driver
-//   ren/rdis      enable / disable roll driver
-//   status        position + sensor snapshot
-//   help          this message
+//   pf <mm>           pitch forward N mm  (FWD-limit protected)
+//   pb <mm>           pitch backward N mm (BWD-limit protected)
+//   rcw <deg>         roll CW N degrees
+//   rccw <deg>        roll CCW N degrees
+//   pen/pdis          enable / disable pitch driver
+//   ren/rdis          enable / disable roll driver
+//   status            position + sensor snapshot
+//   help              this message
 // ============================================================
 
-static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CW;
+static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CCW;
 static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Direction::CW;
 
-static constexpr float    PITCH_HOME_SPEED     = 700.0f;
-static constexpr float    ROLL_HOME_SPEED      = 700.0f;
-static constexpr float    JOG_SPEED            = 400.0f;
+// Pitch runs slower than roll — lower speed keeps the motor in its
+// high-torque region by limiting back-EMF, important for driving the
+// lead screw against the battery pack mass.
+// 150 steps/s caused driver OTP (overtemperature) fault — full current
+// held too long per step. 300 steps/s is a better balance: still strong
+// enough torque while reducing thermal load per phase.
+static constexpr float    PITCH_HOME_SPEED     = 300.0f;  // steps/s
+static constexpr float    PITCH_JOG_SPEED      = 200.0f;  // steps/s
+static constexpr float    ROLL_HOME_SPEED      = 700.0f;  // steps/s  (roll load is lighter)
+static constexpr float    ROLL_JOG_SPEED       = 400.0f;  // steps/s
 static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
 static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 
@@ -83,6 +90,10 @@ static String  rx;
 
 static uint32_t lastLivePrint = 0;
 
+// LED heartbeat
+static uint32_t lastLedToggle = 0;
+static bool     ledOn         = false;
+
 // ----------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------
@@ -99,11 +110,43 @@ static uint32_t absI32(int32_t v) {
 }
 
 // ----------------------------------------------------------------
+// Driver reset helpers
+// ----------------------------------------------------------------
+// DRV8825 latches a fault (OCP / OTP) on the FLT pin and stops
+// outputting current. Toggling the EN pin clears the latch.
+// Call between homing phases and before every jog to ensure a
+// clean slate even if a previous move left the driver faulted.
+static void resetPitchDriver() {
+    pitch.disable();
+    delay(300);   // allow chip to cool and latch to clear
+    pitch.enable();
+    delay(10);
+    if (pitch.faultActive()) {
+        Serial.println("[drv] WARN: pitch fault still active after reset");
+    }
+}
+
+static void resetRollDriver() {
+    roll.disable();
+    delay(100);
+    roll.enable();
+    delay(10);
+    if (roll.faultActive()) {
+        Serial.println("[drv] WARN: roll fault still active after reset");
+    }
+}
+
+// ----------------------------------------------------------------
 // Jog helpers
 // ----------------------------------------------------------------
-static void jogPitch(int32_t steps) {
+// jogPitch: distance in mm (positive = forward, negative = backward).
+// Converts to steps internally. Stops early on limit switch or driver fault.
+static void jogPitch(float mm) {
+    if (mm == 0.0f) return;
+    const int32_t steps = (int32_t)roundf(mm / config::PITCH_STEP_MM);
     if (steps == 0) return;
-    pitch.setSpeed(JOG_SPEED);
+    resetPitchDriver();
+    pitch.setSpeed(PITCH_JOG_SPEED);
     const bool fwd = steps > 0;
     pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
     const uint32_t n = absI32(steps);
@@ -116,14 +159,22 @@ static void jogPitch(int32_t steps) {
         pitchSteps += fwd ? 1 : -1;
         moved++;
     }
-    Serial.print("[jog] pitch moved "); Serial.print(fwd ? "+" : "-");
-    Serial.print(moved); Serial.print(" steps  pos=");
-    Serial.print(pitchStepsToMm(pitchSteps), 3); Serial.println(" mm");
+    Serial.print("[jog] pitch ");
+    Serial.print(fwd ? "+" : "-");
+    Serial.print(moved * config::PITCH_STEP_MM, 2);
+    Serial.print(" mm  pos=");
+    Serial.print(pitchStepsToMm(pitchSteps), 3);
+    Serial.println(" mm");
 }
 
-static void jogRoll(int32_t steps) {
+// jogRoll: angle in degrees (positive = CW, negative = CCW).
+// Converts to steps internally.
+static void jogRoll(float deg) {
+    if (deg == 0.0f) return;
+    const int32_t steps = (int32_t)roundf(deg / config::ROLL_STEP_DEG);
     if (steps == 0) return;
-    roll.setSpeed(JOG_SPEED);
+    resetRollDriver();
+    roll.setSpeed(ROLL_JOG_SPEED);
     const bool cw = steps > 0;
     roll.setDirection(cw ? ROLL_CW_DIR : opposite(ROLL_CW_DIR));
     const uint32_t n = absI32(steps);
@@ -134,9 +185,12 @@ static void jogRoll(int32_t steps) {
         rollSteps += cw ? 1 : -1;
         moved++;
     }
-    Serial.print("[jog] roll moved "); Serial.print(cw ? "+" : "-");
-    Serial.print(moved); Serial.print(" steps  pos=");
-    Serial.print(rollStepsToDeg(rollSteps), 3); Serial.println(" deg");
+    Serial.print("[jog] roll ");
+    Serial.print(cw ? "+" : "-");
+    Serial.print(moved * config::ROLL_STEP_DEG, 2);
+    Serial.print(" deg  pos=");
+    Serial.print(rollStepsToDeg(rollSteps), 3);
+    Serial.println(" deg");
 }
 
 // ----------------------------------------------------------------
@@ -178,11 +232,11 @@ static void printHelp() {
     Serial.println("homer         : run roll homing");
     Serial.println("home          : run pitch + roll homing");
     Serial.println("status        : position + sensor snapshot");
-    Serial.println("--- Jog (N = step count) ---");
-    Serial.println("pf <N>        : pitch forward N steps  (stops at FWD limit)");
-    Serial.println("pb <N>        : pitch backward N steps (stops at BWD limit)");
-    Serial.println("rcw <N>       : roll CW N steps");
-    Serial.println("rccw <N>      : roll CCW N steps");
+    Serial.println("--- Jog ---");
+    Serial.println("pf <mm>       : pitch forward  (e.g. pf 5.0)  stops at FWD limit");
+    Serial.println("pb <mm>       : pitch backward (e.g. pb 2.5)  stops at BWD limit");
+    Serial.println("rcw <deg>     : roll CW        (e.g. rcw 30)");
+    Serial.println("rccw <deg>    : roll CCW       (e.g. rccw 15)");
     Serial.println("--- Motor enable ---");
     Serial.println("pen / pdis    : enable / disable pitch driver");
     Serial.println("ren / rdis    : enable / disable roll driver");
@@ -231,6 +285,11 @@ static bool homePitch() {
         const int32_t fwdHit = pitchSteps;
         Serial.print("[P1] FWD limit hit at step "); Serial.println(fwdHit);
 
+        // Reset driver between phases — clears any thermal latch from P1.
+        Serial.println("[P1] resetting driver before reversal...");
+        resetPitchDriver();
+        if (pitch.faultActive()) { Serial.println("[P1] ABORT: fault persists after reset"); break; }
+
         // ----------------------------------------------------------
         // Phase 2: move BACKWARD until BWD limit switch presses.
         // ----------------------------------------------------------
@@ -255,6 +314,11 @@ static bool homePitch() {
         }
         const int32_t revHit = pitchSteps;
         Serial.print("[P2] BWD limit hit at step "); Serial.println(revHit);
+
+        // Reset driver again before centering move.
+        Serial.println("[P2] resetting driver before centering...");
+        resetPitchDriver();
+        if (pitch.faultActive()) { Serial.println("[P2] ABORT: fault persists after reset"); break; }
 
         const int32_t span = fwdHit - revHit;
         Serial.print("[P2] Span = "); Serial.print(span);
@@ -282,10 +346,13 @@ static bool homePitch() {
                     Serial.println("[P3] ABORT: driver fault while centering");
                     break;
                 }
+                if (fwd  && pitchFwdLimit.isPressed()) { Serial.println("[P3] ABORT: FWD limit hit while centering"); break; }
+                if (!fwd && pitchRevLimit.isPressed()) { Serial.println("[P3] ABORT: BWD limit hit while centering"); break; }
                 pitch.step();
                 pitchSteps += fwd ? 1 : -1;
             }
             if (pitch.faultActive()) break;
+            if (pitchFwdLimit.isPressed() || pitchRevLimit.isPressed()) break;
         }
 
         pitchSteps = 0;
@@ -457,27 +524,27 @@ static void handleCommand(String cmd) {
     if (cmd == "rdis") { roll.disable();  Serial.println("Roll disabled");  return; }
 
     if (cmd.startsWith("pf ")) {
-        int32_t n = cmd.substring(3).toInt();
-        if (n <= 0) { Serial.println("Usage: pf <N>  (N > 0)"); return; }
-        jogPitch(n);
+        float mm = cmd.substring(3).toFloat();
+        if (mm <= 0.0f) { Serial.println("Usage: pf <mm>  e.g. pf 5.0"); return; }
+        jogPitch(mm);
         return;
     }
     if (cmd.startsWith("pb ")) {
-        int32_t n = cmd.substring(3).toInt();
-        if (n <= 0) { Serial.println("Usage: pb <N>  (N > 0)"); return; }
-        jogPitch(-n);
+        float mm = cmd.substring(3).toFloat();
+        if (mm <= 0.0f) { Serial.println("Usage: pb <mm>  e.g. pb 2.5"); return; }
+        jogPitch(-mm);
         return;
     }
     if (cmd.startsWith("rcw ")) {
-        int32_t n = cmd.substring(4).toInt();
-        if (n <= 0) { Serial.println("Usage: rcw <N>  (N > 0)"); return; }
-        jogRoll(n);
+        float deg = cmd.substring(4).toFloat();
+        if (deg <= 0.0f) { Serial.println("Usage: rcw <deg>  e.g. rcw 30"); return; }
+        jogRoll(deg);
         return;
     }
     if (cmd.startsWith("rccw ")) {
-        int32_t n = cmd.substring(5).toInt();
-        if (n <= 0) { Serial.println("Usage: rccw <N>  (N > 0)"); return; }
-        jogRoll(-n);
+        float deg = cmd.substring(5).toFloat();
+        if (deg <= 0.0f) { Serial.println("Usage: rccw <deg>  e.g. rccw 15"); return; }
+        jogRoll(-deg);
         return;
     }
 
@@ -502,6 +569,9 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+
     pitch.begin();
     roll.begin();
     pitchFwdLimit.begin();
@@ -519,10 +589,23 @@ void setup() {
 }
 
 void loop() {
+    const uint32_t now = millis();
+
+    // LED heartbeat: 100 ms flash every 5 s
+    if (!ledOn && (now - lastLedToggle >= 5000)) {
+        digitalWrite(LED_BUILTIN, HIGH);
+        ledOn = true;
+        lastLedToggle = now;
+    }
+    if (ledOn && (now - lastLedToggle >= 100)) {
+        digitalWrite(LED_BUILTIN, LOW);
+        ledOn = false;
+    }
+
     readSerial();
 
-    if (liveMode && millis() - lastLivePrint >= 1000) {
-        lastLivePrint = millis();
+    if (liveMode && now - lastLivePrint >= 1000) {
+        lastLivePrint = now;
         printSensors();
     }
 }
