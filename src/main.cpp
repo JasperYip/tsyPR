@@ -48,7 +48,7 @@ static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Dir
 // 150 steps/s caused driver OTP (overtemperature) fault — full current
 // held too long per step. 300 steps/s is a better balance: still strong
 // enough torque while reducing thermal load per phase.
-static constexpr float    PITCH_HOME_SPEED     = 300.0f;  // steps/s
+static constexpr float    PITCH_HOME_SPEED     = 600.0f;  // steps/s
 static constexpr float    PITCH_JOG_SPEED      = 200.0f;  // steps/s
 static constexpr float    ROLL_HOME_SPEED      = 700.0f;  // steps/s  (roll load is lighter)
 static constexpr float    ROLL_JOG_SPEED       = 400.0f;  // steps/s
@@ -145,14 +145,27 @@ static void jogPitch(float mm) {
     if (mm == 0.0f) return;
     const int32_t steps = (int32_t)roundf(mm / config::PITCH_STEP_MM);
     if (steps == 0) return;
+
+    // Warn if position tracking is already unreliable.
+    if (!pitchHomed) {
+        Serial.println("[jog] WARN: pitch not homed — step counter may not reflect real position");
+    }
+
     resetPitchDriver();
     pitch.setSpeed(PITCH_JOG_SPEED);
     const bool fwd = steps > 0;
     pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
     const uint32_t n = absI32(steps);
     uint32_t moved = 0;
+    bool faulted = false;
     for (uint32_t i = 0; i < n; i++) {
-        if (pitch.faultActive()) { Serial.println("[jog] ABORT pitch: driver fault"); break; }
+        if (pitch.faultActive()) {
+            Serial.println("[jog] ABORT pitch: driver fault");
+            Serial.println("      POSITION LOST — step counter unreliable, rehome required");
+            pitchHomed = false;   // position is no longer trusted
+            faulted = true;
+            break;
+        }
         if (fwd  && pitchFwdLimit.isPressed()) { Serial.println("[jog] STOP pitch: FWD limit hit"); break; }
         if (!fwd && pitchRevLimit.isPressed()) { Serial.println("[jog] STOP pitch: BWD limit hit"); break; }
         pitch.step();
@@ -162,9 +175,15 @@ static void jogPitch(float mm) {
     Serial.print("[jog] pitch ");
     Serial.print(fwd ? "+" : "-");
     Serial.print(moved * config::PITCH_STEP_MM, 2);
-    Serial.print(" mm  pos=");
-    Serial.print(pitchStepsToMm(pitchSteps), 3);
-    Serial.println(" mm");
+    Serial.print(" mm");
+    if (!faulted) {
+        Serial.print("  pos=");
+        Serial.print(pitchStepsToMm(pitchSteps), 3);
+        Serial.print(" mm");
+    } else {
+        Serial.print("  pos=UNKNOWN");
+    }
+    Serial.println();
 }
 
 // jogRoll: angle in degrees (positive = CW, negative = CCW).
@@ -211,9 +230,15 @@ static void printSensors() {
 
 static void printStatus() {
     Serial.println();
-    Serial.print("homed_P="); Serial.print(pitchHomed ? "YES" : "NO");
-    Serial.print("  pitch="); Serial.print(pitchStepsToMm(pitchSteps), 3);
-    Serial.print(" mm  ("); Serial.print(pitchSteps); Serial.println(" steps)");
+    Serial.print("homed_P="); Serial.print(pitchHomed ? "YES" : "NO (REHOME REQUIRED)");
+    Serial.print("  pitch=");
+    if (pitchHomed) {
+        Serial.print(pitchStepsToMm(pitchSteps), 3);
+        Serial.print(" mm  ("); Serial.print(pitchSteps); Serial.print(" steps)");
+    } else {
+        Serial.print("UNKNOWN");
+    }
+    Serial.println();
 
     Serial.print("homed_R="); Serial.print(rollHomed ? "YES" : "NO");
     Serial.print("  roll=");  Serial.print(rollStepsToDeg(rollSteps), 3);
@@ -357,15 +382,31 @@ static bool homePitch() {
 
         pitchSteps = 0;
         pitch.setDirection(PITCH_FORWARD_DIR);
-        pitchHomed = true;
-        ok = true;
+
+        // ----------------------------------------------------------
+        // Sanity check: at claimed centre neither limit should be
+        // pressed. If BWD is still pressed the motor never left the
+        // end-stop — it stalled silently during the centering move.
+        // This is the key guard against open-loop position corruption.
+        // ----------------------------------------------------------
+        if (pitchFwdLimit.isPressed()) {
+            Serial.println("[P3] SANITY FAIL: FWD limit still pressed at claimed centre");
+            Serial.println("     Motor likely stalled during centering. REHOME.");
+        } else if (pitchRevLimit.isPressed()) {
+            Serial.println("[P3] SANITY FAIL: BWD limit still pressed at claimed centre");
+            Serial.println("     Motor did not leave end-stop — stall during centering. REHOME.");
+        } else {
+            pitchHomed = true;
+            ok = true;
+        }
 
     } while (false);
 
     if (ok) {
         Serial.println(">>> PITCH HOMING OK — position zeroed at center");
     } else {
-        Serial.println(">>> PITCH HOMING FAILED");
+        pitchHomed = false;  // guarantee bad state is never silently kept
+        Serial.println(">>> PITCH HOMING FAILED — position unknown, rehome required");
     }
     return ok;
 }
