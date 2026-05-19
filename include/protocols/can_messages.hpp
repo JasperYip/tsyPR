@@ -26,11 +26,11 @@ namespace can
    CAN BASE IDS
 ---------------------------------------------------------- */
 
-constexpr uint16_t STATUS_FAULT_BASE    = 0x053;
-constexpr uint16_t CMD_SETPOINT_BASE    = 0x103;
-constexpr uint16_t STATUS_CONTROL_BASE  = 0x203;
-constexpr uint16_t STATUS_BMS_BASE      = 0x213;
-constexpr uint16_t STATUS_BMS_MORE_BASE = 0x223;
+constexpr uint16_t STATUS_FAULT_BASE    = 0x050;
+constexpr uint16_t CMD_SETPOINT_BASE    = 0x100;
+constexpr uint16_t STATUS_CONTROL_BASE  = 0x200;
+constexpr uint16_t STATUS_BMS_BASE      = 0x210;
+constexpr uint16_t STATUS_BMS_MORE_BASE = 0x220;
 
 
 /* ----------------------------------------------------------
