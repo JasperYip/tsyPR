@@ -24,6 +24,12 @@
 // Set false to run without BMS hardware connected.
 constexpr bool USE_BMS = false;
 
+// Set false to bypass the roll axis entirely.
+// homeRoll() will immediately return success so the Pi sees roll as homed.
+// All roll movement commands are silently skipped.
+// Useful when the roll motor is not physically wired.
+constexpr bool USE_ROLL = false;
+
 // ----------------------------------------------------------------
 // Direction conventions — flip if a motor runs backwards
 // ----------------------------------------------------------------
@@ -36,10 +42,10 @@ static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Dir
 // Pitch runs slower than roll — lower speed stays in the high-torque
 // region of the stepper curve; going too slow causes DRV8825 OTP (overtemp).
 // 400 steps/s is the tested sweet spot for the current load.
-static constexpr float    PITCH_HOME_SPEED     = 400.0f;   // steps/s during homing
-static constexpr float    ROLL_HOME_SPEED      = 700.0f;   // steps/s during homing
-static constexpr float    PITCH_RUN_SPEED      = 600.0f;   // steps/s for normal moves
-static constexpr float    ROLL_RUN_SPEED       = 700.0f;   // steps/s for normal moves
+static constexpr float    PITCH_HOME_SPEED     = 300.0f;   // steps/s during homing
+static constexpr float    ROLL_HOME_SPEED      = 300.0f;   // steps/s during homing
+static constexpr float    PITCH_RUN_SPEED      = 300.0f;   // steps/s for normal moves
+static constexpr float    ROLL_RUN_SPEED       = 300.0f;   // steps/s for normal moves
 static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
 static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 
@@ -190,7 +196,7 @@ static uint32_t absI32(int32_t v)          { return v >= 0 ? (uint32_t)v : (uint
 static bool shouldAbortMove() {
     return (leak.isLeak() || inj_leak)
         || pitch.faultActive()
-        || roll.faultActive();
+        || (USE_ROLL && roll.faultActive());
 }
 
 // ----------------------------------------------------------------
@@ -211,6 +217,7 @@ static void resetPitchDriver() {
 }
 
 static void resetRollDriver() {
+    if (!USE_ROLL) return;
     roll.disable();
     delay(100);
     roll.enable();
@@ -253,6 +260,7 @@ static bool movePitchDelta(int32_t delta) {
 
 // Move roll by |delta| steps; checks abort signals every step.
 static bool moveRollDelta(int32_t delta) {
+    if (!USE_ROLL) return true;  // roll bypassed — silently succeed
     if (delta == 0) return true;
     const bool cw = delta > 0;
     const uint32_t n = absI32(delta);
@@ -437,6 +445,14 @@ static bool homePitch() {
 
 // Roll: dual-magnet hall sensor homing, centres between ±60° magnets.
 static bool homeRoll() {
+    if (!USE_ROLL) {
+        // Roll axis not physically wired — fake success so Pi sees roll as homed.
+        rollHomed        = true;
+        rollHomingFailed = false;
+        rollSteps        = 0;
+        Serial.println(">>> ROLL HOMING BYPASSED (USE_ROLL=false) — reported as homed");
+        return true;
+    }
     Serial.println();
     Serial.println(">>> ROLL HOMING START");
     rollHomed        = false;
@@ -870,11 +886,15 @@ static void printStatus() {
     Serial.print("  flt_P=");   Serial.println(pitch.faultActive() ? "FAULT" : "ok");
 
     Serial.print("  roll=");
-    if (rollHomed) { Serial.print(rollStepsToDeg(rollSteps), 3); Serial.print("deg"); }
-    else Serial.print("UNKNOWN");
-    Serial.print("  tgt=");    Serial.print(targetRollDeg, 2);
-    Serial.print("deg  hall="); Serial.print(rollHall.isActive() ? "ACTIVE" : "inactive");
-    Serial.print("  flt_R=");   Serial.println(roll.faultActive() ? "FAULT" : "ok");
+    if (!USE_ROLL) {
+        Serial.println("BYPASSED (USE_ROLL=false)");
+    } else {
+        if (rollHomed) { Serial.print(rollStepsToDeg(rollSteps), 3); Serial.print("deg"); }
+        else Serial.print("UNKNOWN");
+        Serial.print("  tgt=");    Serial.print(targetRollDeg, 2);
+        Serial.print("deg  hall="); Serial.print(rollHall.isActive() ? "ACTIVE" : "inactive");
+        Serial.print("  flt_R=");   Serial.println(roll.faultActive() ? "FAULT" : "ok");
+    }
 
     Serial.print("  leak=");    Serial.print(leak.isLeak() ? "LEAK" : "ok");
     Serial.print("  HF_A=0x"); Serial.print(lastSafety.hard_fault_a, HEX);
@@ -991,12 +1011,14 @@ static void handleCommand(String cmd) {
         return;
     }
     if (cmd.startsWith("rcw ")) {
+        if (!USE_ROLL) { Serial.println("Roll bypassed (USE_ROLL=false)"); return; }
         float deg = cmd.substring(4).toFloat();
         if (deg <= 0.0f) { Serial.println("Usage: rcw <deg>  e.g. rcw 30"); return; }
         jogRoll(deg);
         return;
     }
     if (cmd.startsWith("rccw ")) {
+        if (!USE_ROLL) { Serial.println("Roll bypassed (USE_ROLL=false)"); return; }
         float deg = cmd.substring(5).toFloat();
         if (deg <= 0.0f) { Serial.println("Usage: rccw <deg>  e.g. rccw 15"); return; }
         jogRoll(-deg);
@@ -1101,16 +1123,15 @@ void setup() {
     digitalWrite(LED_BUILTIN, LOW);
 
     pitch.begin();
-    roll.begin();
+    if (USE_ROLL) roll.begin();
     pitchFwdLimit.begin();
     pitchRevLimit.begin();
-    rollHall.begin();
+    if (USE_ROLL) rollHall.begin();
     leak.begin(false);
 
     pitch.setSpeed(PITCH_RUN_SPEED);
-    roll.setSpeed(ROLL_RUN_SPEED);
     pitch.enable();
-    roll.enable();
+    if (USE_ROLL) { roll.setSpeed(ROLL_RUN_SPEED); roll.enable(); }
     motorsEnabled = true;
 
     safety.configure({});
@@ -1224,7 +1245,7 @@ void loop() {
         SafetyManager::Inputs sin{};
         sin.leak_raw               = leak.isLeak()       || inj_leak;
         sin.driver_fault_pitch_raw = pitch.faultActive() || inj_driver_p;
-        sin.driver_fault_roll_raw  = roll.faultActive()  || inj_driver_r;
+        sin.driver_fault_roll_raw  = (USE_ROLL && roll.faultActive()) || inj_driver_r;
         sin.homing_failed_pitch    = pitchHomingFailed   || inj_home_fail_p;
         sin.homing_failed_roll     = rollHomingFailed    || inj_home_fail_r;
         sin.stall_pitch_raw        = false;  // no current sensing on steppers
