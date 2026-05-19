@@ -55,11 +55,13 @@ static constexpr float    ROLL_JOG_SPEED       = 400.0f;  // steps/s
 static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
 static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 
+// Pitch motor now routed through the ROLL driver (pitch driver is fried).
+// Pitch motor is physically wired to the roll driver board.
 static StepperDriver pitch({
-    .pin_step       = PIN_PITCH_STEP,
-    .pin_dir        = PIN_PITCH_DIR,
-    .pin_en         = PIN_PITCH_ENA,
-    .pin_flt        = PIN_PITCH_FLT,
+    .pin_step       = PIN_ROLL_STEP,
+    .pin_dir        = PIN_ROLL_DIR,
+    .pin_en         = PIN_ROLL_ENA,
+    .pin_flt        = PIN_ROLL_FLT,
     .step_pulse_us  = 5.0f,
     .steps_per_sec  = PITCH_HOME_SPEED,
     .flt_active_low = true,
