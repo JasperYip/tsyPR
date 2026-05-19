@@ -58,11 +58,11 @@ constexpr float DRIVER_FAULT_DEBOUNCE_S = 0.02f;
 
 // command timeout
 constexpr uint32_t CMD_TIMEOUT_SMALL_MS = 300;
-constexpr uint32_t CMD_TIMEOUT_LARGE_MS = 120000;
+constexpr uint32_t CMD_TIMEOUT_LARGE_MS = 180000;
 
 
 // BMS timeout
 constexpr uint32_t BMS_TIMEOUT_SMALL_MS = 5000;
-constexpr uint32_t BMS_TIMEOUT_LARGE_MS = 120000;
+constexpr uint32_t BMS_TIMEOUT_LARGE_MS = 180000;
 
 }

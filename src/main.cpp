@@ -121,7 +121,7 @@ static bool  newSetpointPending = false;
 // ----------------------------------------------------------------
 // CAN bookkeeping
 // ----------------------------------------------------------------
-static uint32_t lastCanRx     = 0;
+static uint32_t lastCanRx     = millis();  // initialised at boot — timeout only starts after first CMD_SETPOINT
 static bool     canRxEver     = false;
 static uint8_t  canSeqControl = 0;
 static uint8_t  canSeqFault   = 0;
@@ -1171,8 +1171,9 @@ void loop() {
     readSerial();
     handleCan();
 
-    // Large CAN timeout: move to NEUTRAL (go to pitch=0 roll=0)
-    if (mode == Mode::CAN && canRxEver &&
+    // Large CAN timeout: move to NEUTRAL (go to pitch=0 roll=0).
+    // Only meaningful when homed — without a home reference there is no safe zero to drive to.
+    if (mode == Mode::CAN && canRxEver && pitchHomed && rollHomed &&
         (now - lastCanRx > config::CMD_TIMEOUT_LARGE_MS)) {
         mode = Mode::NEUTRAL;
         newSetpointPending = false;
@@ -1211,10 +1212,11 @@ void loop() {
     {
         const uint32_t now2    = millis();
         const bool inCanFam    = (mode == Mode::CAN || mode == Mode::NEUTRAL);
-        const bool cmdSmall    = inCanFam && canRxEver && (now2 - lastCanRx > config::CMD_TIMEOUT_SMALL_MS);
+        // Timeouts only count when homed — without a home reference NEUTRAL is meaningless
+        const bool canTimeout  = inCanFam && canRxEver && pitchHomed && rollHomed;
+        const bool cmdSmall    = canTimeout && (now2 - lastCanRx > config::CMD_TIMEOUT_SMALL_MS);
         const bool cmdLarge    = (mode == Mode::NEUTRAL) ||
-                                 (mode == Mode::CAN && canRxEver &&
-                                  (now2 - lastCanRx > config::CMD_TIMEOUT_LARGE_MS));
+                                 (canTimeout && (now2 - lastCanRx > config::CMD_TIMEOUT_LARGE_MS));
 
         const bool bmsEverSeen = USE_BMS && bmsManager.telemetry().any_response;
         const BmsManager::Flags& bmsF = bmsManager.flags();
