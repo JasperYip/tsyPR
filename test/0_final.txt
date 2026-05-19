@@ -1030,7 +1030,10 @@ static void handleCommand(String cmd) {
     if (cmd == "recover") {
         safety.reset(); lastSafety = {};
         pitchHomingFailed = false; rollHomingFailed = false;
-        Serial.println("Safety reset");
+        // Clear DRV8825 hardware fault latch on both drivers (EN toggle)
+        resetPitchDriver();
+        resetRollDriver();
+        Serial.println("Safety + driver faults reset");
         return;
     }
 
