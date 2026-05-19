@@ -27,7 +27,7 @@ constexpr bool USE_BMS = false;
 // ----------------------------------------------------------------
 // Direction conventions — flip if a motor runs backwards
 // ----------------------------------------------------------------
-static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CCW;
+static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CW;
 static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Direction::CW;
 
 // ----------------------------------------------------------------
@@ -542,8 +542,8 @@ static void runHoming() {
 
 // Move both axes to the requested absolute position.
 // Clamps to configured limits; checks safety every step via primitives.
+// Homing is not required — step 0 is treated as the reference (boot position).
 static void executeSetpoint(float pitchMm, float rollDeg) {
-    if (!pitchHomed || !rollHomed) return;
 
     const float pClamped = constrain(pitchMm, config::PITCH_MIN_MM, config::PITCH_MAX_MM);
     const float rClamped = constrain(rollDeg, config::ROLL_MIN_DEG, config::ROLL_MAX_DEG);
@@ -754,9 +754,8 @@ static void handleCan() {
         can::CmdSetpoint cmd;
         can::unpackCmdSetpoint(frame.data, cmd);
 
-        // Homing command — only accepted when not already homed and not already homing
+        // Homing command — accepted any time we are not already homing
         if ((cmd.command_mode & can::CMD_START_HOMING) &&
-            !pitchHomed && !rollHomed &&
             mode != Mode::HOMING) {
             homingReturnMode = Mode::CAN;
             mode = Mode::HOMING;
@@ -772,7 +771,6 @@ static void handleCan() {
         }
 
         if (mode != Mode::CAN) continue;
-        if (!pitchHomed || !rollHomed) continue;
 
         // Decode setpoint (01mm and 01deg units)
         const float pMm  = cmd.pitch_travel_01mm * 0.1f;
@@ -1022,7 +1020,6 @@ static void handleCommand(String cmd) {
     }
 
     if (cmd == "c") {
-        if (!pitchHomed || !rollHomed) { Serial.println("Not homed"); return; }
         mode = Mode::CAN;
         lastCanRx = millis();
         Serial.println("CAN mode");
@@ -1200,8 +1197,8 @@ void loop() {
         }
 
     } else if (newSetpointPending && mode == Mode::CAN) {
-        // Execute a setpoint received from the Pi
-        if (pitchHomed && rollHomed && !lastSafety.hard_fault) {
+        // Execute a setpoint received from the Pi — homing not required
+        if (!lastSafety.hard_fault) {
             newSetpointPending = false;
             executeSetpoint(targetPitchMm, targetRollDeg);
         }
