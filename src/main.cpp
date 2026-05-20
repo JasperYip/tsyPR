@@ -24,6 +24,12 @@
 // Set false to run without BMS hardware connected.
 constexpr bool USE_BMS = false;
 
+// Disable stepper driver when not moving to prevent idle heat buildup.
+// The leadscrew is self-locking so position is held without holding current.
+// Driver re-enables automatically a few ms before each move starts.
+constexpr bool     AUTO_DISABLE_IDLE = true;
+constexpr uint32_t IDLE_DISABLE_MS   = 1000;  // ms after last move before disabling
+
 // Set false to bypass the roll axis entirely.
 // homeRoll() will immediately return success so the Pi sees roll as homed.
 // All roll movement commands are silently skipped.
@@ -68,11 +74,12 @@ static constexpr uint32_t CAN_TX_BMS_INTERVAL_MS     = 500;  //  2 Hz
 // ----------------------------------------------------------------
 // Pitch motor now routed through the ROLL driver (pitch driver is fried).
 // Pitch motor is physically wired to the roll driver board.
+// TB67S581FNG: ENA HIGH = enabled, ENA LOW = outputs off → en_active_low = false
 static StepperDriver pitch({
-    .pin_step       = PIN_ROLL_STEP,
-    .pin_dir        = PIN_ROLL_DIR,
-    .pin_en         = PIN_ROLL_ENA,
-    .pin_flt        = PIN_ROLL_FLT,
+    .pin_step       = PIN_PITCH_STEP,
+    .pin_dir        = PIN_PITCH_DIR,
+    .pin_en         = PIN_PITCH_ENA,
+    .pin_flt        = PIN_PITCH_FLT,
     .step_pulse_us  = 5.0f,
     .steps_per_sec  = PITCH_RUN_SPEED,
     .flt_active_low = true,
@@ -87,7 +94,7 @@ static StepperDriver roll({
     .step_pulse_us  = 5.0f,
     .steps_per_sec  = ROLL_RUN_SPEED,
     .flt_active_low = true,
-    .en_active_low  = true
+    .en_active_low  = false
 });
 
 static PushSwitch pitchFwdLimit({ .pin = PIN_FWD_SWH,   .active_low = true, .use_pullup = true });
@@ -111,6 +118,9 @@ static bool    rollHomed         = false;
 static bool    pitchHomingFailed = false;
 static bool    rollHomingFailed  = false;
 static bool    motorsEnabled     = false;
+static uint32_t lastMoveMs      = 0;    // updated after every move — drives idle-disable timer
+static bool    pitchIdleOff     = false; // true when pitch driver was disabled by idle timer
+static bool    rollIdleOff      = false; // true when roll driver was disabled by idle timer
 
 // ----------------------------------------------------------------
 // Control mode
@@ -192,6 +202,16 @@ static float   pitchStepsToMm(int32_t s)  { return s * config::PITCH_STEP_MM; }
 static float   rollStepsToDeg(int32_t s)  { return s * config::ROLL_STEP_DEG; }
 static uint32_t absI32(int32_t v)          { return v >= 0 ? (uint32_t)v : (uint32_t)(-v); }
 
+// Re-enable any idle-disabled drivers and reset the idle timer.
+// Call before any direct pitch.step() usage that bypasses movePitchDelta.
+static void wakeDrivers() {
+    if (AUTO_DISABLE_IDLE) {
+        if (pitchIdleOff) { pitch.enable(); pitchIdleOff = false; delay(10); }
+        if (USE_ROLL && rollIdleOff) { roll.enable(); rollIdleOff = false; delay(10); }
+    }
+    lastMoveMs = millis();
+}
+
 // Any raw signal that demands immediate move abort
 static bool shouldAbortMove() {
     return (leak.isLeak() || inj_leak)
@@ -237,6 +257,14 @@ static void resetRollDriver() {
 // Returns false if aborted early.
 static bool movePitchDelta(int32_t delta) {
     if (delta == 0) return true;
+
+    // Wake driver if idle-disabled — give it a few ms to stabilise before stepping
+    if (AUTO_DISABLE_IDLE && pitchIdleOff) {
+        pitch.enable();
+        pitchIdleOff = false;
+        delay(10);
+    }
+
     const bool fwd = delta > 0;
     const uint32_t n = absI32(delta);
     pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
@@ -254,6 +282,7 @@ static bool movePitchDelta(int32_t delta) {
         if (!fwd && pitchRevLimit.isPressed()) { Serial.println("[move] STOP pitch: BWD limit hit"); return false; }
         pitch.step();
         pitchSteps += fwd ? 1 : -1;
+        lastMoveMs = millis();
     }
     return true;
 }
@@ -262,6 +291,13 @@ static bool movePitchDelta(int32_t delta) {
 static bool moveRollDelta(int32_t delta) {
     if (!USE_ROLL) return true;  // roll bypassed — silently succeed
     if (delta == 0) return true;
+
+    // Wake driver if idle-disabled
+    if (AUTO_DISABLE_IDLE && rollIdleOff) {
+        roll.enable();
+        rollIdleOff = false;
+        delay(10);
+    }
     const bool cw = delta > 0;
     const uint32_t n = absI32(delta);
     roll.setDirection(cw ? ROLL_CW_DIR : opposite(ROLL_CW_DIR));
@@ -272,6 +308,7 @@ static bool moveRollDelta(int32_t delta) {
         }
         roll.step();
         rollSteps += cw ? 1 : -1;
+        lastMoveMs = millis();
     }
     return true;
 }
@@ -341,6 +378,7 @@ static bool homePitch() {
     pitchHomingFailed = false;
     bool ok = false;
 
+    wakeDrivers();  // ensure driver is on before direct pitch.step() calls in P1/P2
     pitch.setSpeed(PITCH_HOME_SPEED);
 
     do {
@@ -459,6 +497,7 @@ static bool homeRoll() {
     rollHomingFailed = false;
     bool ok = false;
 
+    wakeDrivers();  // ensure driver is on before direct roll.step() calls
     roll.setSpeed(ROLL_HOME_SPEED);
 
     do {
@@ -639,9 +678,10 @@ static void sendStatusControl() {
     msg.roll_angle_01deg = (int16_t)constrain((int)roundf(rollStepsToDeg(rollSteps)  * 10.0f), -32768, 32767);
 
     uint8_t fa = 0;
-    if (pitchHomed)    fa |= can::FLAG_HOMED_P;
-    if (rollHomed)     fa |= can::FLAG_HOMED_R;
-    if (motorsEnabled) fa |= can::FLAG_ENABLE_P | can::FLAG_ENABLE_R;
+    if (pitchHomed)                           fa |= can::FLAG_HOMED_P;
+    if (rollHomed)                            fa |= can::FLAG_HOMED_R;
+    if (motorsEnabled && !pitchIdleOff)       fa |= can::FLAG_ENABLE_P;
+    if (USE_ROLL && motorsEnabled && !rollIdleOff) fa |= can::FLAG_ENABLE_R;
     msg.flagsA = fa;
 
     uint8_t fb = 0;
@@ -873,7 +913,8 @@ static void printStatus() {
     Serial.print("[NODE="); Serial.print(CAN_NODE_ID);
     Serial.print(" BMS=");   Serial.print(USE_BMS ? "EN" : "DIS");
     Serial.print("]  mode="); Serial.print(modeName(mode));
-    Serial.print("  motors="); Serial.print(motorsEnabled ? "EN" : "DIS");
+    Serial.print("  pitch_drv="); Serial.print(!motorsEnabled ? "DIS" : pitchIdleOff ? "IDLE-OFF" : "EN");
+    Serial.print("  roll_drv=");  Serial.print(!USE_ROLL ? "BYPASSED" : !motorsEnabled ? "DIS" : rollIdleOff ? "IDLE-OFF" : "EN");
     Serial.print("  homed_P="); Serial.print(pitchHomed ? "Y" : "N");
     Serial.print("  homed_R="); Serial.println(rollHomed ? "Y" : "N");
 
@@ -937,12 +978,21 @@ static void handleCommand(String cmd) {
 
     if (cmd == "en") {
         if (lastSafety.hard_fault) { Serial.println("Hard fault active — run 'recover' first"); return; }
-        pitch.enable(); roll.enable(); motorsEnabled = true;
+        pitch.enable();
+        if (USE_ROLL) roll.enable();
+        motorsEnabled = true;
+        pitchIdleOff = false;
+        rollIdleOff  = false;
+        lastMoveMs   = millis();  // reset idle timer so driver stays on
         Serial.println("Motors enabled");
         return;
     }
     if (cmd == "dis") {
-        pitch.disable(); roll.disable(); motorsEnabled = false;
+        pitch.disable();
+        if (USE_ROLL) roll.disable();
+        motorsEnabled = false;
+        pitchIdleOff = false;
+        rollIdleOff  = false;
         Serial.println("Motors disabled");
         return;
     }
@@ -1051,9 +1101,13 @@ static void handleCommand(String cmd) {
     if (cmd == "recover") {
         safety.reset(); lastSafety = {};
         pitchHomingFailed = false; rollHomingFailed = false;
-        // Clear DRV8825 hardware fault latch on both drivers (EN toggle)
+        // Clear DRV8825 hardware fault latch (EN toggle) — drivers are enabled after this
         resetPitchDriver();
         resetRollDriver();
+        pitchIdleOff = false;  // resetPitchDriver() left the driver enabled
+        rollIdleOff  = false;
+        lastMoveMs   = millis();  // reset idle timer so driver stays on briefly
+        motorsEnabled = true;
         Serial.println("Safety + driver faults reset");
         return;
     }
@@ -1093,6 +1147,23 @@ static void handleCommand(String cmd) {
     if (cmd == "bhigh1") { inj_bms_high = true;    return; }
     if (cmd == "bhigh0") { inj_bms_high = false;   return; }
 
+    // ---- EN pin diagnostic (temporary) ----
+    // Bypasses all driver logic and toggles the raw pin directly.
+    // 'entest on'  → pin 22 HIGH  (TB67S581FNG: should ENABLE  → motor whines)
+    // 'entest off' → pin 22 LOW   (TB67S581FNG: should DISABLE → motor silent)
+    if (cmd == "entest on")  {
+        pinMode(PIN_ROLL_ENA, OUTPUT);
+        digitalWrite(PIN_ROLL_ENA, HIGH);
+        Serial.println("EN raw HIGH — motor should be ON (whining) if wired");
+        return;
+    }
+    if (cmd == "entest off") {
+        pinMode(PIN_ROLL_ENA, OUTPUT);
+        digitalWrite(PIN_ROLL_ENA, LOW);
+        Serial.println("EN raw LOW — motor should be OFF (silent) if wired");
+        return;
+    }
+
     Serial.print("Unknown: "); Serial.println(cmd);
 }
 
@@ -1130,9 +1201,23 @@ void setup() {
     leak.begin(false);
 
     pitch.setSpeed(PITCH_RUN_SPEED);
-    pitch.enable();
-    if (USE_ROLL) { roll.setSpeed(ROLL_RUN_SPEED); roll.enable(); }
+    if (USE_ROLL) roll.setSpeed(ROLL_RUN_SPEED);
+
+    // Start with driver disabled — no whine on boot.
+    // wakeDrivers() will enable automatically before the first move.
+    if (AUTO_DISABLE_IDLE) {
+        pitch.disable();
+        if (USE_ROLL) roll.disable();
+        pitchIdleOff = true;
+        rollIdleOff  = USE_ROLL;
+    } else {
+        pitch.enable();
+        if (USE_ROLL) roll.enable();
+        pitchIdleOff = false;
+        rollIdleOff  = false;
+    }
     motorsEnabled = true;
+    lastMoveMs = 0;  // ensures idle check fires immediately if somehow driver gets enabled
 
     safety.configure({});
     safety.reset();
@@ -1277,14 +1362,42 @@ void loop() {
         if (lastSafety.hard_fault && !suppress) {
             if (motorsEnabled) {
                 pitch.disable();
-                roll.disable();
+                if (USE_ROLL) roll.disable();
                 motorsEnabled = false;
+                pitchIdleOff = false;  // fault disable takes precedence
+                rollIdleOff  = false;
             }
         } else if (!motorsEnabled) {
             pitch.enable();
-            roll.enable();
+            if (USE_ROLL) roll.enable();
+            pitchIdleOff = false;
+            rollIdleOff  = false;
+            lastMoveMs   = millis();
             motorsEnabled = true;
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Idle auto-disable: cut driver current when no move has occurred
+    // for IDLE_DISABLE_MS. Re-enabled automatically at next move start.
+    // Skipped if a hard fault already holds the driver off.
+    // ----------------------------------------------------------------
+    if (AUTO_DISABLE_IDLE && motorsEnabled && !lastSafety.hard_fault) {
+        const uint32_t now3 = millis();
+        const bool idle = (now3 - lastMoveMs > IDLE_DISABLE_MS);
+        if (idle && !pitchIdleOff) {
+            pitch.disable();
+            pitchIdleOff = true;
+        }
+        if (USE_ROLL && idle && !rollIdleOff) {
+            roll.disable();
+            rollIdleOff = true;
+        }
+    }
+    if (!AUTO_DISABLE_IDLE) {
+        // Feature disabled at compile time — ensure drivers are awake
+        if (pitchIdleOff) { pitch.enable(); pitchIdleOff = false; }
+        if (rollIdleOff)  { roll.enable();  rollIdleOff  = false; }
     }
 
     // ----------------------------------------------------------------
