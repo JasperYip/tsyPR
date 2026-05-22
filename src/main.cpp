@@ -12,6 +12,7 @@
 #include "drivers/leak_sensor.hpp"
 #include "drivers/push_switch.hpp"
 #include "drivers/stepper_driver.hpp"
+#include "drivers/tof_sensor.hpp"
 
 #include "controllers/bms_manager.hpp"
 #include "controllers/safety_manager.hpp"
@@ -29,6 +30,27 @@ constexpr bool USE_BMS = false;
 // Driver re-enables automatically a few ms before each move starts.
 constexpr bool     AUTO_DISABLE_IDLE = true;
 constexpr uint32_t IDLE_DISABLE_MS   = 1000;  // ms after last move before disabling
+
+// Set false to disable ToF sensor (VL6180X on I2C1).
+// When true: tof_mm in STATUS_CONTROL carries live distance;
+//            jogPitch() uses ToF to detect stall and auto-reduce speed.
+constexpr bool     USE_TOF        = true;
+constexpr uint16_t TOF_NEUTRAL_MM = 72;   // expected reading at home/neutral position
+constexpr uint32_t TOF_POLL_MS    = 50;   // background poll interval (ms)
+// Stall detection: if ToF moves less than this per 1mm of commanded jog → stall
+// EMA smoothing on raw ToF readings — reduces sensor jitter on the reported value.
+// alpha=0.25: new reading weighted at 25%, history at 75%. Lower = smoother but laggier.
+constexpr float    TOF_EMA_ALPHA          = 0.25f;
+// Stall detection threshold — must be > typical noise floor (~2mm for VL6180X)
+constexpr uint16_t TOF_STALL_THRESHOLD_MM = 2;
+// Require this many consecutive stall chunks before reducing speed (filters noise spikes)
+constexpr uint8_t  TOF_STALL_CONFIRM      = 2;
+// Auto torque: each confirmed stall reduces pitchJogSpeed by this fraction (0.8 = −20%)
+constexpr float    TOF_STALL_SPEED_FACTOR = 0.80f;
+constexpr float    TOF_STALL_SPEED_MIN    = 80.0f;   // floor — max torque point
+// Jiggle recovery: when at min speed and still stalled, reverse this far then retry
+constexpr float    TOF_JIGGLE_MM          = 2.0f;    // mm to reverse per jiggle
+constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts before giving up
 
 // Set false to bypass the roll axis entirely.
 // homeRoll() will immediately return success so the Pi sees roll as homed.
@@ -101,6 +123,12 @@ static PushSwitch pitchFwdLimit({ .pin = PIN_FWD_SWH,   .active_low = true, .use
 static PushSwitch pitchRevLimit({ .pin = PIN_BWD_SWH,   .active_low = true, .use_pullup = true });
 static HallSensor rollHall     ({ .pin = PIN_HALL_SENS, .active_low = true, .use_pullup = true });
 static LeakSensor leak(PIN_LEAK, true);  // active HIGH
+
+static ToFSensor  tof(PIN_TOF_SDA, PIN_TOF_SCL);
+static uint16_t   tofMm        = 0;     // EMA-filtered reading in mm
+static bool       tofValid     = false;
+static float      tofEma       = 0.0f;  // internal EMA accumulator
+static uint32_t   lastTofPoll  = 0;
 
 static CanBus     canBus;
 static BmsUart    bmsUart({ .serial = &Serial2, .baud = BMS_BAUD });
@@ -615,28 +643,78 @@ static void executeSetpoint(float pitchMm, float rollDeg) {
 // ================================================================
 
 // Jog pitch by ±mm from current position. Uses pitchJogSpeed (runtime settable).
-// Stops on limit switch or fault. Invalidates homed flag on driver fault.
+// When USE_TOF: executes in 1mm chunks and reads ToF between each chunk.
+// If ToF doesn't move despite steps being sent → stall detected →
+//   pitchJogSpeed is reduced by TOF_STALL_SPEED_FACTOR and the move continues
+//   at the new (higher-torque) speed. Speed change persists so the next jog
+//   also benefits; user can reset with 'pspd'.
 static void jogPitch(float mm) {
     if (mm == 0.0f) return;
-    if (!pitchHomed) {
-        Serial.println("[jog] WARN: pitch not homed — step counter unreliable");
-    }
-    const int32_t steps = pitchMmToSteps(mm);
-    if (steps == 0) return;
-    pitch.setSpeed(pitchJogSpeed);
-    const bool ok = movePitchDelta(steps);
-    pitch.setSpeed(PITCH_RUN_SPEED);  // restore run speed afterwards
+    if (!pitchHomed) Serial.println("[jog] WARN: pitch not homed — step counter unreliable");
 
-    const float moved_mm = pitchStepsToMm(pitchSteps);
-    Serial.print("[jog] pitch ");
-    Serial.print(mm > 0 ? "+" : "");
-    Serial.print(mm, 2);
-    Serial.print(" mm");
-    if (pitchHomed && ok) {
-        Serial.print("  pos="); Serial.print(moved_mm, 3); Serial.print(" mm");
-    } else {
-        Serial.print("  pos=UNKNOWN");
+    const int32_t totalSteps = pitchMmToSteps(mm);
+    if (totalSteps == 0) return;
+
+    const int32_t sign      = (totalSteps > 0) ? 1 : -1;
+    const int32_t absTotal  = absI32(totalSteps);
+    // Chunk size = steps per 1mm — gives ToF enough travel to detect movement
+    const int32_t CHUNK     = pitchMmToSteps(1.0f);
+
+    // Snapshot ToF before jog for stall comparison
+    uint16_t tofChunkStart = tofMm;
+    uint8_t  stallCount    = 0;
+
+    pitch.setSpeed(pitchJogSpeed);
+
+    int32_t done = 0;
+    while (done < absTotal) {
+        const int32_t take = min(absTotal - done, CHUNK > 0 ? CHUNK : absTotal);
+        if (!movePitchDelta(sign * take)) break;
+        done += take;
+
+        // ToF stall check — only meaningful when sensor is fitted and valid
+        if (USE_TOF && tofValid && CHUNK > 0 && take == CHUNK) {
+            const ToFSensor::Reading r = tof.read();
+            if (r.valid) {
+                // Apply EMA to mid-jog read as well — keeps it consistent with background poll
+                tofEma = TOF_EMA_ALPHA * static_cast<float>(r.mm)
+                       + (1.0f - TOF_EMA_ALPHA) * tofEma;
+                tofMm = static_cast<uint16_t>(roundf(tofEma));
+
+                const uint16_t delta = (tofMm > tofChunkStart)
+                                     ? (tofMm - tofChunkStart)
+                                     : (tofChunkStart - tofMm);
+
+                if (delta < TOF_STALL_THRESHOLD_MM) {
+                    stallCount++;
+                    // Only act after TOF_STALL_CONFIRM consecutive stall chunks —
+                    // a single noisy reading won't trigger a speed reduction.
+                    if (stallCount >= TOF_STALL_CONFIRM && pitchJogSpeed > TOF_STALL_SPEED_MIN) {
+                        pitchJogSpeed = max(TOF_STALL_SPEED_MIN,
+                                           pitchJogSpeed * TOF_STALL_SPEED_FACTOR);
+                        pitch.setSpeed(pitchJogSpeed);
+                        Serial.print("[jog] stall confirmed ("); Serial.print(stallCount);
+                        Serial.print("x) — speed → "); Serial.print(pitchJogSpeed, 0);
+                        Serial.println(" steps/s");
+                    }
+                } else {
+                    stallCount = 0;  // movement seen — reset consecutive counter
+                }
+                tofChunkStart = tofMm;  // slide window
+            }
+        }
     }
+
+    pitch.setSpeed(PITCH_RUN_SPEED);
+
+    Serial.print("[jog] pitch ");
+    Serial.print(mm > 0 ? "+" : ""); Serial.print(mm, 2); Serial.print(" mm");
+    if (USE_TOF && tofValid) {
+        Serial.print("  tof="); Serial.print(tofMm); Serial.print("mm");
+        if (stallCount) { Serial.print("  STALLS="); Serial.print(stallCount); }
+    }
+    if (pitchHomed) { Serial.print("  pos="); Serial.print(pitchStepsToMm(pitchSteps), 3); Serial.print("mm"); }
+    else            { Serial.print("  pos=UNKNOWN"); }
     Serial.println();
 }
 
@@ -692,7 +770,7 @@ static void sendStatusControl() {
     msg.flagsB = fb;
 
     msg.sequence = canSeqControl++;
-    msg.tof_mm   = 0;  // ToF not fitted on P&R
+    msg.tof_mm   = (USE_TOF && tofValid) ? tofMm : 0;
 
     uint8_t buf[8];
     can::packStatusControl(buf, msg);
@@ -937,6 +1015,12 @@ static void printStatus() {
         Serial.print("  flt_R=");   Serial.println(roll.faultActive() ? "FAULT" : "ok");
     }
 
+    if (USE_TOF) {
+        Serial.print("  tof=");
+        if (tofValid) { Serial.print(tofMm); Serial.print("mm (neutral~"); Serial.print(TOF_NEUTRAL_MM); Serial.print("mm)"); }
+        else Serial.print("invalid");
+        Serial.print("  pspd="); Serial.print(pitchJogSpeed, 0); Serial.println(" steps/s");
+    }
     Serial.print("  leak=");    Serial.print(leak.isLeak() ? "LEAK" : "ok");
     Serial.print("  HF_A=0x"); Serial.print(lastSafety.hard_fault_a, HEX);
     Serial.print("  HF_B=0x"); Serial.print(lastSafety.hard_fault_b, HEX);
@@ -1219,6 +1303,14 @@ void setup() {
     motorsEnabled = true;
     lastMoveMs = 0;  // ensures idle check fires immediately if somehow driver gets enabled
 
+    if (USE_TOF) {
+        if (tof.begin(Wire1)) {
+            Serial.println("[tof] VL6180X OK");
+        } else {
+            Serial.println("[tof] VL6180X NOT FOUND — check wiring");
+        }
+    }
+
     safety.configure({});
     safety.reset();
 
@@ -1271,6 +1363,22 @@ void loop() {
     if (USE_BMS) {
         bmsUart.update();
         bmsManager.update(now);
+    }
+
+    // ToF background poll (non-blocking cadence; not called during blocking moves)
+    if (USE_TOF && (now - lastTofPoll >= TOF_POLL_MS)) {
+        lastTofPoll = now;
+        const ToFSensor::Reading r = tof.read();
+        if (r.valid) {
+            if (!tofValid) {
+                tofEma = static_cast<float>(r.mm);  // seed EMA on first valid reading
+            } else {
+                tofEma = TOF_EMA_ALPHA * static_cast<float>(r.mm)
+                       + (1.0f - TOF_EMA_ALPHA) * tofEma;
+            }
+            tofMm    = static_cast<uint16_t>(roundf(tofEma));
+            tofValid = true;
+        }
     }
 
     // Serial + CAN input processing
