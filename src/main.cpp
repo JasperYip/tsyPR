@@ -35,7 +35,7 @@ constexpr uint32_t IDLE_DISABLE_MS   = 1000;  // ms after last move before disab
 // When true: tof_mm in STATUS_CONTROL carries live distance;
 //            jogPitch() uses ToF to detect stall and auto-reduce speed.
 constexpr bool     USE_TOF        = true;
-constexpr uint16_t TOF_NEUTRAL_MM = 72;   // expected reading at home/neutral position
+constexpr uint16_t TOF_NEUTRAL_MM = 66;   // expected reading at home/neutral position
 constexpr uint32_t TOF_POLL_MS    = 50;   // background poll interval (ms)
 // Stall detection: if ToF moves less than this per 1mm of commanded jog → stall
 // EMA smoothing on raw ToF readings — reduces sensor jitter on the reported value.
@@ -45,9 +45,10 @@ constexpr float    TOF_EMA_ALPHA          = 0.25f;
 constexpr uint16_t TOF_STALL_THRESHOLD_MM = 2;
 // Require this many consecutive stall chunks before reducing speed (filters noise spikes)
 constexpr uint8_t  TOF_STALL_CONFIRM      = 2;
-// Auto torque: each confirmed stall reduces pitchJogSpeed by this fraction (0.8 = −20%)
-constexpr float    TOF_STALL_SPEED_FACTOR = 0.80f;
-constexpr float    TOF_STALL_SPEED_MIN    = 80.0f;   // floor — max torque point
+// Auto torque: each confirmed stall reduces pitchJogSpeed by this fraction
+// 0.70 = −30% per stall event — aggressive drop gets to max torque faster
+constexpr float    TOF_STALL_SPEED_FACTOR = 0.70f;
+constexpr float    TOF_STALL_SPEED_MIN    = 25.0f;   // floor — full-step motor, can go this low safely
 // Jiggle recovery: when at min speed and still stalled, reverse this far then retry
 constexpr float    TOF_JIGGLE_MM          = 2.0f;    // mm to reverse per jiggle
 constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts before giving up
@@ -56,12 +57,12 @@ constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts befo
 // homeRoll() will immediately return success so the Pi sees roll as homed.
 // All roll movement commands are silently skipped.
 // Useful when the roll motor is not physically wired.
-constexpr bool USE_ROLL = false;
+constexpr bool USE_ROLL = true;
 
 // ----------------------------------------------------------------
 // Direction conventions — flip if a motor runs backwards
 // ----------------------------------------------------------------
-static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CW;
+static constexpr StepperDriver::Direction PITCH_FORWARD_DIR = StepperDriver::Direction::CCW;
 static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Direction::CW;
 
 // ----------------------------------------------------------------
@@ -72,7 +73,7 @@ static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Dir
 // 400 steps/s is the tested sweet spot for the current load.
 static constexpr float    PITCH_HOME_SPEED     = 300.0f;   // steps/s during homing
 static constexpr float    ROLL_HOME_SPEED      = 300.0f;   // steps/s during homing
-static constexpr float    PITCH_RUN_SPEED      = 300.0f;   // steps/s for normal moves
+static constexpr float    PITCH_RUN_SPEED      = 400.0f;   // steps/s for CAN setpoint moves — stay in torque band
 static constexpr float    ROLL_RUN_SPEED       = 300.0f;   // steps/s for normal moves
 static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
 static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
@@ -80,13 +81,13 @@ static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 // Jog speeds — runtime adjustable via 'pspd' / 'rspd' commands.
 // Lower pitch jog speed = more torque (less back-EMF).
 // Default 300 steps/s gives good torque without OTP risk.
-static float pitchJogSpeed = 300.0f;
+static float pitchJogSpeed = 500.0f;   // starts fast, auto-reduces to 25 on stall
 static float rollJogSpeed  = 400.0f;
 
 // ----------------------------------------------------------------
 // CAN
 // ----------------------------------------------------------------
-static constexpr uint8_t  CAN_NODE_ID                = config::NODE_ID_LEFT;  // NODE 3
+static constexpr uint8_t  CAN_NODE_ID                = config::NODE_ID_PR;  // NODE 3
 static constexpr uint32_t CAN_TX_CONTROL_INTERVAL_MS = 20;   // 50 Hz
 static constexpr uint32_t CAN_TX_FAULT_INTERVAL_MS   = 500;  //  2 Hz
 static constexpr uint32_t CAN_TX_BMS_INTERVAL_MS     = 500;  //  2 Hz
@@ -116,7 +117,7 @@ static StepperDriver roll({
     .step_pulse_us  = 5.0f,
     .steps_per_sec  = ROLL_RUN_SPEED,
     .flt_active_low = true,
-    .en_active_low  = false
+    .en_active_low  = true
 });
 
 static PushSwitch pitchFwdLimit({ .pin = PIN_FWD_SWH,   .active_low = true, .use_pullup = true });
@@ -488,12 +489,90 @@ static bool homePitch() {
         // against open-loop position corruption on a loaded leadscrew.
         if (pitchFwdLimit.isPressed()) {
             Serial.println("[P3] SANITY FAIL: FWD limit still pressed at centre — stall during centering. REHOME.");
+            break;
         } else if (pitchRevLimit.isPressed()) {
             Serial.println("[P3] SANITY FAIL: BWD limit still pressed at centre — motor did not move. REHOME.");
-        } else {
-            pitchHomed = true;
-            ok = true;
+            break;
         }
+
+        // ----------------------------------------------------------
+        // P4: ToF closed-loop correction to neutral (only when USE_TOF)
+        // Flush the EMA with live readings first, then jog in 1mm
+        // increments until tofMm == TOF_NEUTRAL_MM ± tolerance.
+        // Auto-detects which jog direction moves toward target.
+        // ----------------------------------------------------------
+        if (USE_TOF) {
+            Serial.println("[P4] ToF correction to neutral...");
+
+            // Flush EMA — 10 readings × 50ms = 500ms settle
+            for (uint8_t i = 0; i < 10; i++) {
+                delay(TOF_POLL_MS);
+                const ToFSensor::Reading r = tof.read();
+                if (r.valid) {
+                    tofEma = (i == 0) ? r.mm  // hard-seed first reading
+                           : TOF_EMA_ALPHA * r.mm + (1.0f - TOF_EMA_ALPHA) * tofEma;
+                    tofMm  = static_cast<uint16_t>(roundf(tofEma));
+                    tofValid = true;
+                }
+            }
+            Serial.print("[P4] ToF settled: "); Serial.print(tofMm);
+            Serial.print("mm  target: "); Serial.print(TOF_NEUTRAL_MM); Serial.println("mm");
+
+            constexpr int16_t TOF_CORRECT_TOL = 3;  // ±3mm acceptable
+
+            // Probe direction: jog +2mm, see if ToF moves toward or away from target
+            bool fwdIncreasesTof = true;  // will be set by probe
+            {
+                const uint16_t tofPre = tofMm;
+                movePitchDelta(pitchMmToSteps(2.0f));
+                delay(100);
+                for (uint8_t i = 0; i < 5; i++) {
+                    delay(TOF_POLL_MS);
+                    const ToFSensor::Reading r = tof.read();
+                    if (r.valid) {
+                        tofEma = TOF_EMA_ALPHA * r.mm + (1.0f - TOF_EMA_ALPHA) * tofEma;
+                        tofMm  = static_cast<uint16_t>(roundf(tofEma));
+                    }
+                }
+                fwdIncreasesTof = (tofMm > tofPre);
+                Serial.print("[P4] probe: "); Serial.print(tofPre); Serial.print("mm → ");
+                Serial.print(tofMm); Serial.print("mm  fwd=");
+                Serial.println(fwdIncreasesTof ? "increases ToF" : "decreases ToF");
+            }
+
+            // Jog toward target in 1mm steps, max 30 attempts
+            for (uint8_t attempt = 0; attempt < 30; attempt++) {
+                const int16_t err = (int16_t)tofMm - (int16_t)TOF_NEUTRAL_MM;
+                if (abs(err) <= TOF_CORRECT_TOL) {
+                    Serial.print("[P4] converged: "); Serial.print(tofMm); Serial.println("mm ✓");
+                    break;
+                }
+                // err > 0 → tofMm too high → need to move to reduce ToF
+                // fwdIncreasesTof: reduce ToF by going backward (neg)
+                const float step = (err > 0)
+                    ? (fwdIncreasesTof ? -1.0f :  1.0f)
+                    : (fwdIncreasesTof ?  1.0f : -1.0f);
+                if (!movePitchDelta(pitchMmToSteps(step))) break;
+                delay(100);
+                for (uint8_t i = 0; i < 4; i++) {
+                    delay(TOF_POLL_MS);
+                    const ToFSensor::Reading r = tof.read();
+                    if (r.valid) {
+                        tofEma = TOF_EMA_ALPHA * r.mm + (1.0f - TOF_EMA_ALPHA) * tofEma;
+                        tofMm  = static_cast<uint16_t>(roundf(tofEma));
+                    }
+                }
+            }
+
+            // Zero step counter here — ToF position is the true reference
+            pitchSteps = 0;
+            Serial.print("[P4] done: ToF="); Serial.print(tofMm);
+            Serial.print("mm  err=±"); Serial.print(abs((int16_t)tofMm - (int16_t)TOF_NEUTRAL_MM));
+            Serial.println("mm");
+        }
+
+        pitchHomed = true;
+        ok = true;
 
     } while (false);
 
@@ -1162,7 +1241,7 @@ static void handleCommand(String cmd) {
     // Runtime jog speed adjustment (lower speed = more torque for stuck pitch)
     if (cmd.startsWith("pspd ")) {
         float spd = cmd.substring(5).toFloat();
-        if (spd < 50.0f || spd > 2000.0f) { Serial.println("pspd: valid range 50–2000 steps/s"); return; }
+        if (spd < 25.0f || spd > 500.0f) { Serial.println("pspd: valid range 25–500 steps/s"); return; }
         pitchJogSpeed = spd;
         Serial.print("Pitch jog speed set to "); Serial.print(spd, 0); Serial.println(" steps/s");
         return;

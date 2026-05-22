@@ -25,7 +25,7 @@ namespace config
    NODE CONFIGURATION
 ---------------------------------------------------------- */
 
-constexpr uint8_t NODE_ID_LEFT  = 3;
+constexpr uint8_t NODE_ID_PR  = 3;
 
 /* ----------------------------------------------------------
    STEP GEOMETRY
