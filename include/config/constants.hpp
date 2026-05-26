@@ -58,7 +58,7 @@ constexpr float DRIVER_FAULT_DEBOUNCE_S = 0.50f;  // 500ms — allows VMOT to ra
 
 // command timeout
 constexpr uint32_t CMD_TIMEOUT_SMALL_MS = 300;
-constexpr uint32_t CMD_TIMEOUT_LARGE_MS = 180000;
+constexpr uint32_t CMD_TIMEOUT_LARGE_MS = 300000;
 
 
 // BMS timeout

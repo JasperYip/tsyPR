@@ -1058,9 +1058,15 @@ static void handleCan() {
         can::CmdSetpoint cmd;
         can::unpackCmdSetpoint(frame.data, cmd);
 
-        // Homing command — accepted any time we are not already homing
-        if ((cmd.command_mode & can::CMD_START_HOMING) &&
-            mode != Mode::HOMING) {
+        // Homing command — trigger on rising edge only (0→1 transition).
+        // Pi may hold CMD_START_HOMING high for multiple frames; without edge
+        // detection homing would re-trigger immediately after completing.
+        static bool lastHomingBit = false;
+        const bool homingBit = (cmd.command_mode & can::CMD_START_HOMING) != 0;
+        const bool homingRising = homingBit && !lastHomingBit;
+        lastHomingBit = homingBit;
+
+        if (homingRising && mode != Mode::HOMING) {
             homingReturnMode = Mode::CAN;
             mode = Mode::HOMING;
             Serial.println("CAN: homing triggered");
