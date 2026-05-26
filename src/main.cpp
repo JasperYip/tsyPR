@@ -61,7 +61,7 @@ constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts befo
 // homeRoll() will immediately return success so the Pi sees roll as homed.
 // All roll movement commands are silently skipped.
 // Useful when the roll motor is not physically wired.
-constexpr bool USE_ROLL = true;
+constexpr bool USE_ROLL = false;  // roll mechanism disabled — pitch-only testing
 
 // ----------------------------------------------------------------
 // Direction conventions — flip if a motor runs backwards
@@ -1593,7 +1593,7 @@ void loop() {
     // Large CAN timeout: move to NEUTRAL (go to pitch=0 roll=0).
     // Only meaningful when homed — without a home reference there is no safe zero to drive to.
     if (mode == Mode::CAN && canRxEver && pitchHomed && rollHomed &&
-        (now - lastCanRx > config::CMD_TIMEOUT_LARGE_MS)) {
+        (millis() - lastCanRx > config::CMD_TIMEOUT_LARGE_MS)) {
         mode = Mode::NEUTRAL;
         newSetpointPending = false;
         Serial.println("!! CAN timeout — entering NEUTRAL (pitch=0 roll=0)");
