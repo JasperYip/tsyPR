@@ -30,12 +30,13 @@ constexpr uint8_t PIN_CAN_R = 0;   // connected to transceiver R (RO)
 constexpr uint8_t PIN_CAN_D = 1;   // connected to transceiver D (DI)
 
 // =====================
-// Roll Driver (DRV8825)
+// Pitch Driver (DRV8825)
 // =====================
-constexpr uint8_t PIN_PITCH_DIR = 2;   // Pitch motor direction
-constexpr uint8_t PIN_PITCH_STEP = 3;   // Pitch motor step
-constexpr uint8_t PIN_PITCH_ENA = 4;   // Pitch motor enable ()
-constexpr uint8_t PIN_PITCH_FLT  = 5;  // Pitch motor fault
+constexpr uint8_t PIN_PITCH_DIR     = 2;  // Pitch motor direction
+constexpr uint8_t PIN_PITCH_STEP    = 3;  // Pitch motor step
+constexpr uint8_t PIN_PITCH_ENA     = 4;  // Pitch motor enable
+constexpr uint8_t PIN_PITCH_FLT     = 5;  // Pitch motor fault (active-low)
+constexpr uint8_t PIN_PITCH_SLP_RST = 6;  // Pitch SLP+RST tied together (LOW = sleep+reset, HIGH = run)
 // constexpr uint8_t PIN_PITCH_DIR = 20;   // Pitch motor direction
 // constexpr uint8_t PIN_PITCH_STEP = 21;   // Pitch motor step
 // constexpr uint8_t PIN_PITCH_ENA = 22;   // Pitch motor enable ()
@@ -71,7 +72,7 @@ constexpr uint8_t PIN_TOF_SDA = 17;
 constexpr uint8_t PIN_LEAK = 18;
 
 // =====================
-// Pitch Driver (DRV8825)
+// Roll Driver (DRV8825)
 // =====================
 constexpr uint8_t PIN_ROLL_DIR = 20;   // Roll motor direction
 constexpr uint8_t PIN_ROLL_STEP = 21;   // Roll motor step

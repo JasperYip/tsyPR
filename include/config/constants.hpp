@@ -54,7 +54,7 @@ constexpr float HOMING_TIMEOUT_S = 60.0f;
 
 // debounce
 constexpr float LEAK_DEBOUNCE_S = 0.05f;
-constexpr float DRIVER_FAULT_DEBOUNCE_S = 0.02f;
+constexpr float DRIVER_FAULT_DEBOUNCE_S = 0.50f;  // 500ms — allows VMOT to ramp up before FLT is trusted
 
 // command timeout
 constexpr uint32_t CMD_TIMEOUT_SMALL_MS = 300;

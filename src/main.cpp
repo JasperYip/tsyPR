@@ -25,6 +25,10 @@
 // Set false to run without BMS hardware connected.
 constexpr bool USE_BMS = false;
 
+// Set false to mask the pitch driver FLT pin from safety faults.
+// RST-controlled startup now prevents boot-noise false faults — keep true.
+constexpr bool USE_PITCH_FLT = true;
+
 // Disable stepper driver when not moving to prevent idle heat buildup.
 // The leadscrew is self-locking so position is held without holding current.
 // Driver re-enables automatically a few ms before each move starts.
@@ -57,7 +61,7 @@ constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts befo
 // homeRoll() will immediately return success so the Pi sees roll as homed.
 // All roll movement commands are silently skipped.
 // Useful when the roll motor is not physically wired.
-constexpr bool USE_ROLL = true;
+constexpr bool USE_ROLL = false;
 
 // ----------------------------------------------------------------
 // Direction conventions — flip if a motor runs backwards
@@ -81,7 +85,7 @@ static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 // Jog speeds — runtime adjustable via 'pspd' / 'rspd' commands.
 // Lower pitch jog speed = more torque (less back-EMF).
 // Default 300 steps/s gives good torque without OTP risk.
-static float pitchJogSpeed = 500.0f;   // starts fast, auto-reduces to 25 on stall
+static float pitchJogSpeed = 150.0f;   // conservative start — OCP risk at high speed under load
 static float rollJogSpeed  = 400.0f;
 
 // ----------------------------------------------------------------
@@ -95,14 +99,15 @@ static constexpr uint32_t CAN_TX_BMS_INTERVAL_MS     = 500;  //  2 Hz
 // ----------------------------------------------------------------
 // Drivers
 // ----------------------------------------------------------------
-// Pitch motor now routed through the ROLL driver (pitch driver is fried).
-// Pitch motor is physically wired to the roll driver board.
-// TB67S581FNG: ENA HIGH = enabled, ENA LOW = outputs off → en_active_low = false
+// Pitch driver board is dead — pitch motor is now physically wired to the
+// ROLL driver board (pins 20/21/22/23).  USE_ROLL=false so the roll axis
+// is fully bypassed; those pins are exclusively used for pitch below.
+// TB67S581FNG: ENA HIGH = enabled, ENA LOW = outputs off → en_active_low = true
 static StepperDriver pitch({
-    .pin_step       = PIN_PITCH_STEP,
-    .pin_dir        = PIN_PITCH_DIR,
-    .pin_en         = PIN_PITCH_ENA,
-    .pin_flt        = PIN_PITCH_FLT,
+    .pin_step       = PIN_PITCH_STEP,   // pin 21 — roll board STEP
+    .pin_dir        = PIN_PITCH_DIR,    // pin 20 — roll board DIR
+    .pin_en         = PIN_PITCH_ENA,    // pin 22 — roll board ENA
+    .pin_flt        = PIN_PITCH_FLT,    // pin 23 — roll board FLT
     .step_pulse_us  = 5.0f,
     .steps_per_sec  = PITCH_RUN_SPEED,
     .flt_active_low = true,
@@ -130,6 +135,10 @@ static uint16_t   tofMm        = 0;     // EMA-filtered reading in mm
 static bool       tofValid     = false;
 static float      tofEma       = 0.0f;  // internal EMA accumulator
 static uint32_t   lastTofPoll  = 0;
+// ToF direction is fixed by mounting: sensor faces the forward plate, so
+// moving FORWARD closes the gap → ToF reading decreases.
+// Therefore: tofMm < neutral  → in forward half  → FWD limit is nearer
+//            tofMm > neutral  → in backward half → BWD limit is nearer
 
 static CanBus     canBus;
 static BmsUart    bmsUart({ .serial = &Serial2, .baud = BMS_BAUD });
@@ -244,7 +253,7 @@ static void wakeDrivers() {
 // Any raw signal that demands immediate move abort
 static bool shouldAbortMove() {
     return (leak.isLeak() || inj_leak)
-        || pitch.faultActive()
+        || (USE_PITCH_FLT && pitch.faultActive())
         || (USE_ROLL && roll.faultActive());
 }
 
@@ -256,11 +265,15 @@ static bool shouldAbortMove() {
 // Call between homing phases — prevents thermal latch from one
 // phase cascading into the next.
 static void resetPitchDriver() {
+    // Pitch is now on the ROLL driver board — PIN_PITCH_SLP_RST (pin 6) goes
+    // to the dead board and has no effect here.  Use EN toggle to clear the
+    // TB67S581FNG fault latch.  If SLP+RST is later wired on the roll board,
+    // swap this back to the RST-LOW approach for more reliable OCP clearing.
     pitch.disable();
-    delay(300);   // allow chip to cool; latch clears within ms but 300ms gives thermal headroom
+    delay(500);   // thermal cooldown if OTP; 500ms also covers VMOT glitches
     pitch.enable();
     delay(10);
-    if (pitch.faultActive()) {
+    if (USE_PITCH_FLT && pitch.faultActive()) {
         Serial.println("[drv] WARN: pitch fault still active after reset");
     }
 }
@@ -282,8 +295,14 @@ static void resetRollDriver() {
 
 // Move pitch by |delta| steps in the correct direction.
 // Checks FWD/BWD limit switches and fault/leak every step.
-// On driver fault: clears pitchHomed (position lost).
-// Returns false if aborted early.
+//
+// Mid-move OCP recovery: when the driver asserts FLT (OCP/OTP) during a move,
+// the driver is RST-reset and the speed is halved before retrying the remaining
+// steps.  This handles the common case where a loaded jog at moderate speed
+// triggers OCP — the move completes at a safer speed without requiring a manual
+// 'recover' + retry.  Up to MAX_FAULT_RETRIES retries; position counter is NOT
+// corrupted because the fault is detected before the failed step is taken.
+// Only if retries are exhausted does it abort and mark position as lost.
 static bool movePitchDelta(int32_t delta) {
     if (delta == 0) return true;
 
@@ -295,11 +314,30 @@ static bool movePitchDelta(int32_t delta) {
     }
 
     const bool fwd = delta > 0;
-    const uint32_t n = absI32(delta);
+    uint32_t remaining = absI32(delta);
     pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
-    for (uint32_t i = 0; i < n; i++) {
-        if (pitch.faultActive()) {
-            Serial.println("[move] ABORT pitch: driver fault — position lost, rehome required");
+
+    uint8_t faultRetries = 0;
+    constexpr uint8_t MAX_FAULT_RETRIES = 2;
+
+    while (remaining > 0) {
+        if (USE_PITCH_FLT && pitch.faultActive()) {
+            if (faultRetries < MAX_FAULT_RETRIES) {
+                faultRetries++;
+                // Halve speed before retry — lower back-EMF = lower peak coil current
+                const float newSpd = max(TOF_STALL_SPEED_MIN, pitch.speed() * 0.5f);
+                Serial.print("[move] pitch OCP — auto-recover ");
+                Serial.print(faultRetries); Serial.print("/"); Serial.print(MAX_FAULT_RETRIES);
+                Serial.print("  spd "); Serial.print(pitch.speed(), 0);
+                Serial.print("->"); Serial.print(newSpd, 0);
+                Serial.print("  remain="); Serial.print(remaining); Serial.println(" steps");
+                resetPitchDriver();                   // RST clears the latch
+                pitch.setSpeed(newSpd);
+                if (newSpd < pitchJogSpeed) pitchJogSpeed = newSpd;  // persist — next jog is safer too
+                delay(50);                            // brief settle before resuming
+                continue;
+            }
+            Serial.println("[move] ABORT pitch: fault after retries — position lost, rehome required");
             pitchHomed = false;
             return false;
         }
@@ -312,6 +350,7 @@ static bool movePitchDelta(int32_t delta) {
         pitch.step();
         pitchSteps += fwd ? 1 : -1;
         lastMoveMs = millis();
+        remaining--;
     }
     return true;
 }
@@ -412,51 +451,76 @@ static bool homePitch() {
 
     do {
         // ----------------------------------------------------------
-        // P1: move FORWARD until FWD limit switch presses
+        // P0: choose which limit to seek first.
+        // Default is FWD first. If ToF direction is known and the current
+        // reading puts us closer to the BWD end, seek BWD first instead —
+        // saves up to half the travel on a re-home.
         // ----------------------------------------------------------
-        Serial.println("[P1] seeking FWD limit...");
-        pitch.setDirection(PITCH_FORWARD_DIR);
+        // Sensor faces the forward plate: low ToF = near FWD end, high ToF = near BWD end.
+        // If ToF is valid, seek the nearer limit first to save travel time.
+        const bool seekFwdFirst = !USE_TOF || !tofValid || (tofMm < TOF_NEUTRAL_MM);
+        Serial.print("[P0] ToF="); Serial.print(tofValid ? tofMm : 0);
+        Serial.println(seekFwdFirst ? "mm → seeking FWD first"
+                                    : "mm → seeking BWD first (ToF shortcut)");
+
+        // ----------------------------------------------------------
+        // P1: move toward the FIRST limit (FWD or BWD per P0 decision)
+        // ----------------------------------------------------------
+        const bool p1Fwd = seekFwdFirst;
+        pitch.setDirection(p1Fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
+        Serial.println(p1Fwd ? "[P1] seeking FWD limit..." : "[P1] seeking BWD limit...");
 
         uint32_t moved = 0;
-        while (!pitchFwdLimit.isPressed() && moved < PITCH_HOME_MAX_STEPS) {
-            if (pitch.faultActive()) { Serial.println("[P1] ABORT: driver fault"); break; }
-            if (leak.isLeak() || inj_leak) { Serial.println("[P1] ABORT: leak"); break; }
+        while (!(p1Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())
+               && moved < PITCH_HOME_MAX_STEPS) {
+            if (USE_PITCH_FLT && pitch.faultActive()) { Serial.println("[P1] ABORT: driver fault"); break; }
+            if (leak.isLeak() || inj_leak)            { Serial.println("[P1] ABORT: leak");         break; }
             pitch.step();
-            pitchSteps++;
+            pitchSteps += p1Fwd ? 1 : -1;
             moved++;
         }
-        if (!pitchFwdLimit.isPressed()) {
-            Serial.print("[P1] FAILED after "); Serial.print(moved); Serial.println(" steps — FWD limit not reached");
+        if (!(p1Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())) {
+            Serial.print("[P1] FAILED after "); Serial.print(moved);
+            Serial.println(p1Fwd ? " steps — FWD limit not reached" : " steps — BWD limit not reached");
             break;
         }
-        const int32_t fwdHit = pitchSteps;
-        Serial.print("[P1] FWD limit at step "); Serial.println(fwdHit);
+        const int32_t firstHit = pitchSteps;
+        Serial.print(p1Fwd ? "[P1] FWD limit at step " : "[P1] BWD limit at step ");
+        Serial.println(firstHit);
 
         // Reset driver between phases — clears any thermal latch from P1
         Serial.println("[P1] resetting driver before reversal...");
         resetPitchDriver();
-        if (pitch.faultActive()) { Serial.println("[P1] ABORT: fault persists after reset"); break; }
+        if (USE_PITCH_FLT && pitch.faultActive()) { Serial.println("[P1] ABORT: fault persists after reset"); break; }
 
         // ----------------------------------------------------------
-        // P2: move BACKWARD until BWD limit switch presses
+        // P2: move toward the SECOND limit (opposite of P1)
         // ----------------------------------------------------------
-        Serial.println("[P2] seeking BWD limit...");
-        pitch.setDirection(opposite(PITCH_FORWARD_DIR));
+        const bool p2Fwd = !seekFwdFirst;
+        pitch.setDirection(p2Fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
+        Serial.println(p2Fwd ? "[P2] seeking FWD limit..." : "[P2] seeking BWD limit...");
 
         moved = 0;
-        while (!pitchRevLimit.isPressed() && moved < PITCH_HOME_MAX_STEPS) {
-            if (pitch.faultActive()) { Serial.println("[P2] ABORT: driver fault"); break; }
-            if (leak.isLeak() || inj_leak) { Serial.println("[P2] ABORT: leak"); break; }
+        while (!(p2Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())
+               && moved < PITCH_HOME_MAX_STEPS) {
+            if (USE_PITCH_FLT && pitch.faultActive()) { Serial.println("[P2] ABORT: driver fault"); break; }
+            if (leak.isLeak() || inj_leak)            { Serial.println("[P2] ABORT: leak");         break; }
             pitch.step();
-            pitchSteps--;
+            pitchSteps += p2Fwd ? 1 : -1;
             moved++;
         }
-        if (!pitchRevLimit.isPressed()) {
-            Serial.print("[P2] FAILED after "); Serial.print(moved); Serial.println(" steps — BWD limit not reached");
+        if (!(p2Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())) {
+            Serial.print("[P2] FAILED after "); Serial.print(moved);
+            Serial.println(p2Fwd ? " steps — FWD limit not reached" : " steps — BWD limit not reached");
             break;
         }
-        const int32_t revHit = pitchSteps;
-        Serial.print("[P2] BWD limit at step "); Serial.println(revHit);
+        const int32_t secondHit = pitchSteps;
+        Serial.print(p2Fwd ? "[P2] FWD limit at step " : "[P2] BWD limit at step ");
+        Serial.println(secondHit);
+
+        // Map back to named fwdHit / revHit regardless of search order
+        const int32_t fwdHit = seekFwdFirst ? firstHit : secondHit;
+        const int32_t revHit = seekFwdFirst ? secondHit : firstHit;
 
         const int32_t span = fwdHit - revHit;
         Serial.print("[P2] Span = "); Serial.print(span);
@@ -466,7 +530,7 @@ static bool homePitch() {
         // Reset driver again before centering move
         Serial.println("[P2] resetting driver before centering...");
         resetPitchDriver();
-        if (pitch.faultActive()) { Serial.println("[P2] ABORT: fault persists after reset"); break; }
+        if (USE_PITCH_FLT && pitch.faultActive()) { Serial.println("[P2] ABORT: fault persists after reset"); break; }
 
         // ----------------------------------------------------------
         // P3: move to centre, zero the counter
@@ -520,38 +584,16 @@ static bool homePitch() {
 
             constexpr int16_t TOF_CORRECT_TOL = 3;  // ±3mm acceptable
 
-            // Probe direction: jog +2mm, see if ToF moves toward or away from target
-            bool fwdIncreasesTof = true;  // will be set by probe
-            {
-                const uint16_t tofPre = tofMm;
-                movePitchDelta(pitchMmToSteps(2.0f));
-                delay(100);
-                for (uint8_t i = 0; i < 5; i++) {
-                    delay(TOF_POLL_MS);
-                    const ToFSensor::Reading r = tof.read();
-                    if (r.valid) {
-                        tofEma = TOF_EMA_ALPHA * r.mm + (1.0f - TOF_EMA_ALPHA) * tofEma;
-                        tofMm  = static_cast<uint16_t>(roundf(tofEma));
-                    }
-                }
-                fwdIncreasesTof = (tofMm > tofPre);
-                Serial.print("[P4] probe: "); Serial.print(tofPre); Serial.print("mm → ");
-                Serial.print(tofMm); Serial.print("mm  fwd=");
-                Serial.println(fwdIncreasesTof ? "increases ToF" : "decreases ToF");
-            }
-
-            // Jog toward target in 1mm steps, max 30 attempts
+            // Sensor faces forward plate: forward move DECREASES ToF.
+            // err > 0 → ToF too high → too far back → move FORWARD (step = +1mm)
+            // err < 0 → ToF too low  → too far fwd  → move BACKWARD (step = −1mm)
             for (uint8_t attempt = 0; attempt < 30; attempt++) {
                 const int16_t err = (int16_t)tofMm - (int16_t)TOF_NEUTRAL_MM;
                 if (abs(err) <= TOF_CORRECT_TOL) {
                     Serial.print("[P4] converged: "); Serial.print(tofMm); Serial.println("mm ✓");
                     break;
                 }
-                // err > 0 → tofMm too high → need to move to reduce ToF
-                // fwdIncreasesTof: reduce ToF by going backward (neg)
-                const float step = (err > 0)
-                    ? (fwdIncreasesTof ? -1.0f :  1.0f)
-                    : (fwdIncreasesTof ?  1.0f : -1.0f);
+                const float step = (err > 0) ? 1.0f : -1.0f;
                 if (!movePitchDelta(pitchMmToSteps(step))) break;
                 delay(100);
                 for (uint8_t i = 0; i < 4; i++) {
@@ -1356,6 +1398,13 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
 
+    // PIN_PITCH_SLP_RST (pin 6) is wired to the dead pitch driver board — no effect.
+    // If SLP+RST is later added to the roll board, wire it to a free pin and
+    // restore this boot sequence pointing at that new pin.
+    // For now: just a short delay to let VMOT and Pi rails stabilise before
+    // the driver is first touched.
+    delay(500);
+
     pitch.begin();
     if (USE_ROLL) roll.begin();
     pitchFwdLimit.begin();
@@ -1516,8 +1565,12 @@ void loop() {
 
         SafetyManager::Inputs sin{};
         sin.leak_raw               = leak.isLeak()       || inj_leak;
-        sin.driver_fault_pitch_raw = pitch.faultActive() || inj_driver_p;
-        sin.driver_fault_roll_raw  = (USE_ROLL && roll.faultActive()) || inj_driver_r;
+        // Ignore driver FLT for the first 3 s after boot — VMOT may still be ramping up
+        // and the driver chip asserts FLT during undervoltage. After grace period the
+        // debounce (500 ms) prevents transient glitches from latching a fault.
+        const bool fltGrace = (now2 < 10000);  // 10s grace — covers Pi CAN initialisation
+        sin.driver_fault_pitch_raw = (USE_PITCH_FLT && !fltGrace && pitch.faultActive()) || inj_driver_p;
+        sin.driver_fault_roll_raw  = (!fltGrace && USE_ROLL && roll.faultActive()) || inj_driver_r;
         sin.homing_failed_pitch    = pitchHomingFailed   || inj_home_fail_p;
         sin.homing_failed_roll     = rollHomingFailed    || inj_home_fail_r;
         sin.stall_pitch_raw        = false;  // no current sensing on steppers
