@@ -155,7 +155,8 @@ static bool    rollHomed         = false;
 static bool    pitchHomingFailed = false;
 static bool    rollHomingFailed  = false;
 static bool    motorsEnabled     = false;
-static uint32_t lastMoveMs      = 0;    // updated after every move — drives idle-disable timer
+static uint32_t lastPitchMoveMs = 0;    // updated after every pitch step — drives pitch idle-disable
+static uint32_t lastRollMoveMs  = 0;    // updated after every roll step  — drives roll  idle-disable
 static bool    pitchIdleOff     = false; // true when pitch driver was disabled by idle timer
 static bool    rollIdleOff      = false; // true when roll driver was disabled by idle timer
 
@@ -242,11 +243,13 @@ static uint32_t absI32(int32_t v)          { return v >= 0 ? (uint32_t)v : (uint
 // Re-enable any idle-disabled drivers and reset the idle timer.
 // Call before any direct pitch.step() usage that bypasses movePitchDelta.
 static void wakeDrivers() {
+    const uint32_t now = millis();
     if (AUTO_DISABLE_IDLE) {
         if (pitchIdleOff) { pitch.enable(); pitchIdleOff = false; delay(10); }
         if (USE_ROLL && rollIdleOff) { roll.enable(); rollIdleOff = false; delay(10); }
     }
-    lastMoveMs = millis();
+    lastPitchMoveMs = now;
+    lastRollMoveMs  = now;
 }
 
 // Any raw signal that demands immediate move abort
@@ -343,7 +346,7 @@ static bool movePitchDelta(int32_t delta) {
         if (!fwd && pitchRevLimit.isPressed()) { Serial.println("[move] STOP pitch: BWD limit hit"); return false; }
         pitch.step();
         pitchSteps += fwd ? 1 : -1;
-        lastMoveMs = millis();
+        lastPitchMoveMs = millis();
         remaining--;
     }
     return true;
@@ -370,7 +373,7 @@ static bool moveRollDelta(int32_t delta) {
         }
         roll.step();
         rollSteps += cw ? 1 : -1;
-        lastMoveMs = millis();
+        lastRollMoveMs = millis();
     }
     return true;
 }
@@ -732,6 +735,19 @@ static void runHoming() {
     Serial.print("  roll="); Serial.println(r ? "OK" : "FAIL");
     if (p && r) { targetPitchMm = 0.0f; targetRollDeg = 0.0f; }
     mode = homingReturnMode;
+
+    // Reset CAN timeout — don't count the homing duration against the Pi.
+    // The Pi may have gone quiet while waiting for homing to complete;
+    // it gets a fresh CMD_TIMEOUT window from this point.
+    lastCanRx = millis();
+
+    // Immediately cut holding current on both drivers — the loop is blocked
+    // during homing so the idle-disable timer never runs. Without this the
+    // motors whine until the next main-loop iteration fires the 1s timer.
+    if (AUTO_DISABLE_IDLE) {
+        pitch.disable();  pitchIdleOff = true;
+        if (USE_ROLL) { roll.disable(); rollIdleOff = true; }
+    }
 }
 
 // ================================================================
@@ -1243,7 +1259,8 @@ static void handleCommand(String cmd) {
         motorsEnabled = true;
         pitchIdleOff = false;
         rollIdleOff  = false;
-        lastMoveMs   = millis();  // reset idle timer so driver stays on
+        lastPitchMoveMs = millis();
+        lastRollMoveMs  = millis();
         Serial.println("Motors enabled");
         return;
     }
@@ -1366,7 +1383,8 @@ static void handleCommand(String cmd) {
         resetRollDriver();
         pitchIdleOff = false;  // resetPitchDriver() left the driver enabled
         rollIdleOff  = false;
-        lastMoveMs   = millis();  // reset idle timer so driver stays on briefly
+        lastPitchMoveMs = millis();
+        lastRollMoveMs  = millis();
         motorsEnabled = true;
         Serial.println("Safety + driver faults reset");
         return;
@@ -1487,7 +1505,8 @@ void setup() {
         rollIdleOff  = false;
     }
     motorsEnabled = true;
-    lastMoveMs = 0;  // ensures idle check fires immediately if somehow driver gets enabled
+    lastPitchMoveMs = 0;  // ensures idle check fires immediately on boot
+    lastRollMoveMs  = 0;
 
     if (USE_TOF) {
         if (tof.begin(Wire1)) {
@@ -1670,7 +1689,8 @@ void loop() {
             if (USE_ROLL) roll.enable();
             pitchIdleOff = false;
             rollIdleOff  = false;
-            lastMoveMs   = millis();
+            lastPitchMoveMs = millis();
+            lastRollMoveMs  = millis();
             motorsEnabled = true;
         }
     }
@@ -1682,12 +1702,11 @@ void loop() {
     // ----------------------------------------------------------------
     if (AUTO_DISABLE_IDLE && motorsEnabled && !lastSafety.hard_fault) {
         const uint32_t now3 = millis();
-        const bool idle = (now3 - lastMoveMs > IDLE_DISABLE_MS);
-        if (idle && !pitchIdleOff) {
+        if (!pitchIdleOff && (now3 - lastPitchMoveMs > IDLE_DISABLE_MS)) {
             pitch.disable();
             pitchIdleOff = true;
         }
-        if (USE_ROLL && idle && !rollIdleOff) {
+        if (USE_ROLL && !rollIdleOff && (now3 - lastRollMoveMs > IDLE_DISABLE_MS)) {
             roll.disable();
             rollIdleOff = true;
         }
