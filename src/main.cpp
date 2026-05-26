@@ -39,7 +39,7 @@ constexpr uint32_t IDLE_DISABLE_MS   = 1000;  // ms after last move before disab
 // When true: tof_mm in STATUS_CONTROL carries live distance;
 //            jogPitch() uses ToF to detect stall and auto-reduce speed.
 constexpr bool     USE_TOF        = true;
-constexpr uint16_t TOF_NEUTRAL_MM = 66;   // expected reading at home/neutral position
+constexpr uint16_t TOF_NEUTRAL_MM = 65;   // expected reading at home/neutral position
 constexpr uint32_t TOF_POLL_MS    = 50;   // background poll interval (ms)
 // Stall detection: if ToF moves less than this per 1mm of commanded jog → stall
 // EMA smoothing on raw ToF readings — reduces sensor jitter on the reported value.
@@ -61,7 +61,7 @@ constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts befo
 // homeRoll() will immediately return success so the Pi sees roll as homed.
 // All roll movement commands are silently skipped.
 // Useful when the roll motor is not physically wired.
-constexpr bool USE_ROLL = false;
+constexpr bool USE_ROLL = true;
 
 // ----------------------------------------------------------------
 // Direction conventions — flip if a motor runs backwards
@@ -99,15 +99,14 @@ static constexpr uint32_t CAN_TX_BMS_INTERVAL_MS     = 500;  //  2 Hz
 // ----------------------------------------------------------------
 // Drivers
 // ----------------------------------------------------------------
-// Pitch driver board is dead — pitch motor is now physically wired to the
-// ROLL driver board (pins 20/21/22/23).  USE_ROLL=false so the roll axis
-// is fully bypassed; those pins are exclusively used for pitch below.
-// TB67S581FNG: ENA HIGH = enabled, ENA LOW = outputs off → en_active_low = true
+// Pitch motor on pitch driver board (pins 2/3/4/5).
+// PIN_PITCH_SLP_RST (pin 6) tied to SLP+RST — HIGH = driver awake, LOW = sleep+reset.
+// TB67S581FNG on Pololu carrier: en_active_low = true (confirmed working)
 static StepperDriver pitch({
-    .pin_step       = PIN_PITCH_STEP,   // pin 21 — roll board STEP
-    .pin_dir        = PIN_PITCH_DIR,    // pin 20 — roll board DIR
-    .pin_en         = PIN_PITCH_ENA,    // pin 22 — roll board ENA
-    .pin_flt        = PIN_PITCH_FLT,    // pin 23 — roll board FLT
+    .pin_step       = PIN_PITCH_STEP,   // pin 3
+    .pin_dir        = PIN_PITCH_DIR,    // pin 2
+    .pin_en         = PIN_PITCH_ENA,    // pin 4
+    .pin_flt        = PIN_PITCH_FLT,    // pin 5
     .step_pulse_us  = 5.0f,
     .steps_per_sec  = PITCH_RUN_SPEED,
     .flt_active_low = true,
@@ -260,18 +259,13 @@ static bool shouldAbortMove() {
 // ----------------------------------------------------------------
 // Driver reset helpers
 // ----------------------------------------------------------------
-// DRV8825 latches a fault (OCP / OTP) on the FLT pin and stops
-// outputting current. Toggling EN clears the latch.
-// Call between homing phases — prevents thermal latch from one
-// phase cascading into the next.
+// TB67S581FNG latches a fault (OCP/OTP) on the FLT pin.
+// Driving RST LOW clears the latch — more reliable than EN toggle.
+// SLP+RST are tied together on pin 6: LOW = sleep+reset, HIGH = run.
 static void resetPitchDriver() {
-    // Pitch is now on the ROLL driver board — PIN_PITCH_SLP_RST (pin 6) goes
-    // to the dead board and has no effect here.  Use EN toggle to clear the
-    // TB67S581FNG fault latch.  If SLP+RST is later wired on the roll board,
-    // swap this back to the RST-LOW approach for more reliable OCP clearing.
-    pitch.disable();
-    delay(500);   // thermal cooldown if OTP; 500ms also covers VMOT glitches
-    pitch.enable();
+    digitalWrite(PIN_PITCH_SLP_RST, LOW);   // sleep + reset → fault latch cleared
+    delay(500);                              // thermal cooldown if OTP was the cause
+    digitalWrite(PIN_PITCH_SLP_RST, HIGH);  // wake driver
     delay(10);
     if (USE_PITCH_FLT && pitch.faultActive()) {
         Serial.println("[drv] WARN: pitch fault still active after reset");
@@ -1398,12 +1392,15 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
 
-    // PIN_PITCH_SLP_RST (pin 6) is wired to the dead pitch driver board — no effect.
-    // If SLP+RST is later added to the roll board, wire it to a free pin and
-    // restore this boot sequence pointing at that new pin.
-    // For now: just a short delay to let VMOT and Pi rails stabilise before
-    // the driver is first touched.
-    delay(500);
+    // Hold pitch driver in sleep+reset during boot.
+    // Pi power-up noise can assert FLT before VMOT is stable.
+    // RST LOW clears any transient fault latch; SLP LOW disables outputs.
+    // Both released once rails are settled.
+    pinMode(PIN_PITCH_SLP_RST, OUTPUT);
+    digitalWrite(PIN_PITCH_SLP_RST, LOW);   // driver asleep + in reset
+    delay(500);                              // wait for Pi / VMOT to stabilise
+    digitalWrite(PIN_PITCH_SLP_RST, HIGH);  // wake driver — fault latch cleared by RST
+    delay(10);
 
     pitch.begin();
     if (USE_ROLL) roll.begin();
