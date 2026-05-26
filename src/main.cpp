@@ -738,9 +738,58 @@ static void runHoming() {
 // Setpoint execution
 // ================================================================
 
+// ToF closed-loop correction after a pitch setpoint move.
+// At home (pitch=0) ToF == TOF_NEUTRAL_MM. Moving forward 1mm closes the gap
+// by 1mm, so: targetToF = TOF_NEUTRAL_MM - pitchMm.
+// Flushes EMA, then jogs in 1mm steps until within TOF_SETPOINT_TOL.
+// Only runs when homed (zero reference is required for the formula to hold).
+static void correctPitchWithToF(float targetPitchMm) {
+    if (!USE_TOF || !tofValid || !pitchHomed) return;
+
+    const int16_t targetToF = (int16_t)TOF_NEUTRAL_MM - (int16_t)roundf(targetPitchMm);
+
+    // Flush EMA — 5 readings × 50ms = 250ms settle
+    for (uint8_t i = 0; i < 5; i++) {
+        delay(TOF_POLL_MS);
+        const ToFSensor::Reading r = tof.read();
+        if (r.valid) {
+            tofEma = TOF_EMA_ALPHA * r.mm + (1.0f - TOF_EMA_ALPHA) * tofEma;
+            tofMm  = static_cast<uint16_t>(roundf(tofEma));
+        }
+    }
+
+    constexpr int16_t TOF_SETPOINT_TOL = 2;  // ±2mm
+    constexpr uint8_t MAX_CORRECT      = 10; // max 1mm steps before giving up
+
+    for (uint8_t attempt = 0; attempt < MAX_CORRECT; attempt++) {
+        const int16_t err = (int16_t)tofMm - targetToF;
+        if (abs(err) <= TOF_SETPOINT_TOL) break;
+        // err > 0: ToF too high = too far back = move forward
+        // err < 0: ToF too low  = too far fwd  = move backward
+        const float step = (err > 0) ? 1.0f : -1.0f;
+        if (!movePitchDelta(pitchMmToSteps(step))) break;
+        delay(100);
+        for (uint8_t i = 0; i < 4; i++) {
+            delay(TOF_POLL_MS);
+            const ToFSensor::Reading r = tof.read();
+            if (r.valid) {
+                tofEma = TOF_EMA_ALPHA * r.mm + (1.0f - TOF_EMA_ALPHA) * tofEma;
+                tofMm  = static_cast<uint16_t>(roundf(tofEma));
+            }
+        }
+    }
+
+    Serial.print("[tof-corr] tgt="); Serial.print(targetPitchMm, 1);
+    Serial.print("mm  tofTgt="); Serial.print(targetToF);
+    Serial.print("mm  tofNow="); Serial.print(tofMm);
+    Serial.print("mm  err=");    Serial.println((int16_t)tofMm - targetToF);
+}
+
 // Move both axes to the requested absolute position.
 // Clamps to configured limits; checks safety every step via primitives.
 // Homing is not required — step 0 is treated as the reference (boot position).
+// When homed and ToF is valid, pitch position is closed-loop corrected after
+// the step-based move to account for any skipped steps or load-induced error.
 static void executeSetpoint(float pitchMm, float rollDeg) {
 
     const float pClamped = constrain(pitchMm, config::PITCH_MIN_MM, config::PITCH_MAX_MM);
@@ -749,8 +798,14 @@ static void executeSetpoint(float pitchMm, float rollDeg) {
     const int32_t pDelta = pitchMmToSteps(pClamped) - pitchSteps;
     const int32_t rDelta = rollDegToSteps(rClamped)  - rollSteps;
 
-    if (pDelta != 0) { pitch.setSpeed(PITCH_RUN_SPEED); movePitchDelta(pDelta); }
+    bool pitchCompleted = true;
+    if (pDelta != 0) { pitch.setSpeed(PITCH_RUN_SPEED); pitchCompleted = movePitchDelta(pDelta); }
     if (rDelta != 0) { roll.setSpeed(ROLL_RUN_SPEED);   moveRollDelta(rDelta);  }
+
+    // Closed-loop ToF correction — only when pitch move completed fully.
+    // If a limit switch or fault stopped the move early, skip correction:
+    // the motor is at a physical boundary and can't reach the target anyway.
+    if (pDelta != 0 && pitchCompleted) correctPitchWithToF(pClamped);
 }
 
 // ================================================================
