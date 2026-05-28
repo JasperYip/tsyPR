@@ -436,6 +436,34 @@ static uint8_t mapBmsStatus(uint16_t s) {
 // Pitch: two-end limit-switch homing, centre and zero.
 // Includes driver reset between phases (prevents OTP cascade fault).
 // Post-centering sanity check detects open-loop stall.
+// Called inside blocking homing loops to keep CAN status fresh.
+// Polls ToF at its normal cadence and broadcasts STATUS_CONTROL so the Pi
+// can track position and ToF distance while homing is in progress.
+static void tickHoming() {
+    const uint32_t t = millis();
+
+    // ToF background read — same cadence as main loop
+    static uint32_t lastHomingTof = 0;
+    if (USE_TOF && (t - lastHomingTof >= TOF_POLL_MS)) {
+        lastHomingTof = t;
+        const ToFSensor::Reading r = tof.read();
+        if (r.valid) {
+            tofEma   = tofValid
+                     ? TOF_EMA_ALPHA * r.mm + (1.0f - TOF_EMA_ALPHA) * tofEma
+                     : static_cast<float>(r.mm);
+            tofMm    = static_cast<uint16_t>(roundf(tofEma));
+            tofValid = true;
+        }
+    }
+
+    // CAN STATUS_CONTROL broadcast — 50 Hz
+    static uint32_t lastHomingTx = 0;
+    if (t - lastHomingTx >= CAN_TX_CONTROL_INTERVAL_MS) {
+        lastHomingTx = t;
+        sendStatusControl();
+    }
+}
+
 static bool homePitch() {
     Serial.println();
     Serial.println(">>> PITCH HOMING START");
@@ -475,6 +503,7 @@ static bool homePitch() {
             pitch.step();
             pitchSteps += p1Fwd ? 1 : -1;
             moved++;
+            tickHoming();
         }
         if (!(p1Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())) {
             Serial.print("[P1] FAILED after "); Serial.print(moved);
@@ -505,6 +534,7 @@ static bool homePitch() {
             pitch.step();
             pitchSteps += p2Fwd ? 1 : -1;
             moved++;
+            tickHoming();
         }
         if (!(p2Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())) {
             Serial.print("[P2] FAILED after "); Serial.print(moved);
@@ -935,10 +965,14 @@ static bool isFrameDifferentIgnoreSeq(const CanFrame& a, const CanFrame& b, uint
 }
 
 // STATUS_CONTROL (0x203 + node_id) — 50 Hz
-// pitch_pos_01mm, roll_angle_01deg, flagsA, flagsB, sequence, tof_mm(unused=0)
+// pitch_pos_01mm: ToF-derived when homed+valid (slip-immune), falls back to step count.
+// Formula: pitchMm = TOF_NEUTRAL_MM - tofEma  (forward move closes gap → ToF decreases)
 static void sendStatusControl() {
     can::StatusControl msg{};
-    msg.pitch_pos_01mm   = (int16_t)constrain((int)roundf(pitchStepsToMm(pitchSteps) * 10.0f), -32768, 32767);
+    const float pitchMm_report = (USE_TOF && tofValid && pitchHomed)
+        ? ((float)TOF_NEUTRAL_MM - tofEma)
+        : pitchStepsToMm(pitchSteps);
+    msg.pitch_pos_01mm   = (int16_t)constrain((int)roundf(pitchMm_report * 10.0f), -32768, 32767);
     msg.roll_angle_01deg = (int16_t)constrain((int)roundf(rollStepsToDeg(rollSteps)  * 10.0f), -32768, 32767);
 
     uint8_t fa = 0;
@@ -1583,6 +1617,13 @@ void loop() {
             }
             tofMm    = static_cast<uint16_t>(roundf(tofEma));
             tofValid = true;
+
+            // Sync step counter from ToF — corrects accumulated slip.
+            // pitchMm = TOF_NEUTRAL_MM - tofEma (forward move closes gap).
+            // Only apply when homed; during homing pitchSteps has a different meaning.
+            if (pitchHomed) {
+                pitchSteps = pitchMmToSteps((float)TOF_NEUTRAL_MM - tofEma);
+            }
         }
     }
 
