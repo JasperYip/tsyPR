@@ -52,7 +52,7 @@ constexpr uint8_t  TOF_STALL_CONFIRM      = 2;
 // Auto torque: each confirmed stall reduces pitchJogSpeed by this fraction
 // 0.70 = −30% per stall event — aggressive drop gets to max torque faster
 constexpr float    TOF_STALL_SPEED_FACTOR = 0.70f;
-constexpr float    TOF_STALL_SPEED_MIN    = 400.0f;  // floor — 1/16 microstep floor (was 25 × 16)
+constexpr float    TOF_STALL_SPEED_MIN    = 800.0f;  // floor = PITCH_RAMP_START_SPD — never go below ramp entry speed
 // Jiggle recovery: when at min speed and still stalled, reverse this far then retry
 constexpr float    TOF_JIGGLE_MM          = 2.0f;    // mm to reverse per jiggle
 constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts before giving up
@@ -77,7 +77,7 @@ static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Dir
 // Speeds are in microsteps/s (1/16 microstepping — M2 pin soldered HIGH on TB67S581FNG).
 // Physical mm/s is unchanged: PITCH_STEP_MM is now 0.000625mm so ×16 steps/s = same mm/s.
 // e.g. 6400 microsteps/s × 0.000625mm = 4.0 mm/s  (was 400 steps/s × 0.01mm = 4.0 mm/s ✓)
-static constexpr float    PITCH_HOME_SPEED     = 9600.0f;  // microsteps/s during homing  (6.0 mm/s @ 1/16)
+static constexpr float    PITCH_HOME_SPEED     = 16000.0f; // microsteps/s during homing  (10.0 mm/s @ 1/16)
 static constexpr float    ROLL_HOME_SPEED      = 400.0f;   // pps during homing (NFP-GW4632-25BY 337:1)
 static constexpr float    PITCH_RUN_SPEED      = 16000.0f; // microsteps/s for CAN setpoint moves (10.0 mm/s @ 1/16)
 static constexpr float    ROLL_RUN_SPEED       = 700.0f;   // pps for CAN setpoint moves (31.5°/s @ 337:1)
@@ -91,7 +91,7 @@ static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 // Jog speeds — runtime adjustable via 'pspd' / 'rspd' commands.
 // Lower pitch jog speed = more torque (less back-EMF).
 // Default 300 steps/s gives good torque without OTP risk.
-static float pitchJogSpeed = 6400.0f;  // microsteps/s jog speed (4.0 mm/s @ 1/16)
+static float pitchJogSpeed = 9600.0f;  // microsteps/s jog speed (6.0 mm/s @ 1/16)
 static float rollJogSpeed  = 500.0f;   // pps jog speed
 
 // ----------------------------------------------------------------
@@ -331,7 +331,78 @@ static bool movePitchDelta(int32_t delta) {
     uint32_t stepsDone = 0;
     pitch.setSpeed(min(PITCH_RAMP_START_SPD, rampTarget));
 
+    uint8_t jiggleCount = 0;
+
+    // Periodic serial + ToF stall state — checked every 16 steps.
+    // Serial progress only printed for moves > 5mm — suppresses noise from
+    // short ToF correction steps and other small internal moves.
+    const bool printProgress = absI32(delta) > pitchMmToSteps(5.0f);
+    uint32_t lastPrintMs  = millis();
+    uint32_t lastTofMs    = millis();
+    uint16_t prevTofRaw   = tofMm;
+    uint8_t  tofStallCount = 0;
+
     while (remaining > 0) {
+        // Every 16 steps: serial progress + ToF stall check
+        if ((stepsDone & 15) == 0 && stepsDone > 0) {
+            const uint32_t now = millis();
+
+            // Serial progress — every 1s, only for moves > 5mm
+            if (printProgress && (now - lastPrintMs >= 1000)) {
+                lastPrintMs = now;
+                const float posMm = (USE_TOF && tofValid && pitchHomed)
+                    ? ((float)TOF_NEUTRAL_MM - tofEma) : pitchStepsToMm(pitchSteps);
+                Serial.print("[move] pos="); Serial.print(posMm, 1);
+                Serial.print("mm  tof="); Serial.print(tofMm);
+                Serial.print("mm  remain="); Serial.print(remaining * config::PITCH_STEP_MM, 1);
+                Serial.println("mm");
+            }
+
+            // ToF stall check — every 100ms using raw reading
+            if (USE_TOF && tofValid && (now - lastTofMs >= 100)) {
+                lastTofMs = now;
+                const ToFSensor::Reading r = tof.read();
+                if (r.valid) {
+                    tofEma = TOF_EMA_ALPHA * r.mm + (1.0f - TOF_EMA_ALPHA) * tofEma;
+                    tofMm  = static_cast<uint16_t>(roundf(tofEma));
+                    const uint16_t rawDelta = (r.mm > prevTofRaw)
+                        ? (r.mm - prevTofRaw) : (prevTofRaw - r.mm);
+                    if (rawDelta < 1) {
+                        tofStallCount++;
+                    } else {
+                        tofStallCount = 0;
+                    }
+                    prevTofRaw = r.mm;
+
+                    // Two consecutive 100ms intervals with no ToF movement = stall
+                    if (tofStallCount >= 2 && faultRetries < MAX_FAULT_RETRIES && jiggleCount < TOF_JIGGLE_MAX) {
+                        faultRetries++;
+                        jiggleCount++;
+                        tofStallCount = 0;
+                        Serial.print("[move] ToF stall — jiggle ");
+                        Serial.print(jiggleCount); Serial.print("/"); Serial.print(TOF_JIGGLE_MAX);
+                        Serial.print("  tof="); Serial.print(tofMm); Serial.println("mm");
+                        resetPitchDriver();
+                        const int32_t jiggleSteps = pitchMmToSteps(TOF_JIGGLE_MM);
+                        pitch.setSpeed(PITCH_RAMP_START_SPD);
+                        pitch.setDirection(fwd ? opposite(PITCH_FORWARD_DIR) : PITCH_FORWARD_DIR);
+                        for (int32_t j = 0; j < jiggleSteps; j++) pitch.step();
+                        pitchSteps += fwd ? -jiggleSteps : jiggleSteps;
+                        remaining  += jiggleSteps;
+                        pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
+                        const float newSpd = max(TOF_STALL_SPEED_MIN, rampTarget * 0.75f);
+                        rampTarget = newSpd;
+                        pitch.setSpeed(min(PITCH_RAMP_START_SPD, rampTarget));
+                        stepsDone = 0;
+                        delay(50);
+                        prevTofRaw = tofMm;
+                        lastTofMs  = millis();
+                        continue;
+                    }
+                }
+            }
+        }
+
         if (USE_PITCH_FLT && pitch.faultActive()) {
             if (faultRetries < MAX_FAULT_RETRIES) {
                 faultRetries++;
@@ -342,10 +413,28 @@ static bool movePitchDelta(int32_t delta) {
                 Serial.print("->"); Serial.print(newSpd, 0);
                 Serial.print("  remain="); Serial.print(remaining); Serial.println(" steps");
                 resetPitchDriver();
+
+                // Jiggle: reverse a short distance to re-engage the leadscrew,
+                // then come back — helps when the nut has climbed off the thread.
+                if (jiggleCount < TOF_JIGGLE_MAX) {
+                    jiggleCount++;
+                    const int32_t jiggleSteps = pitchMmToSteps(TOF_JIGGLE_MM);
+                    Serial.print("[move] jiggle "); Serial.print(jiggleCount);
+                    Serial.print("/"); Serial.print(TOF_JIGGLE_MAX);
+                    Serial.print(" ("); Serial.print(TOF_JIGGLE_MM, 1); Serial.println("mm reverse)");
+                    pitch.setSpeed(PITCH_RAMP_START_SPD);
+                    pitch.setDirection(fwd ? opposite(PITCH_FORWARD_DIR) : PITCH_FORWARD_DIR);
+                    for (int32_t j = 0; j < jiggleSteps; j++) pitch.step();
+                    pitchSteps += fwd ? -jiggleSteps : jiggleSteps;
+                    remaining  += jiggleSteps;  // account for ground lost
+                    pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
+                    delay(50);
+                }
+
                 rampTarget = newSpd;
                 pitch.setSpeed(min(PITCH_RAMP_START_SPD, rampTarget));
                 if (newSpd < pitchJogSpeed) pitchJogSpeed = newSpd;
-                stepsDone = 0;  // restart ramp from bottom
+                stepsDone = 0;
                 delay(50);
                 continue;
             }
@@ -467,24 +556,11 @@ static void sendStatusControl();  // forward declaration — defined later
 // Called inside blocking homing loops to keep CAN status fresh.
 // Polls ToF at its normal cadence and broadcasts STATUS_CONTROL so the Pi
 // can track position and ToF distance while homing is in progress.
+// Called in the P1/P2 step loops every 16 steps — keeps CAN status fresh without
+// blocking I2C reads that would stutter the step timing. ToF value sent is the
+// last reading from before homing started; position (pitchSteps) is live.
 static void tickHoming() {
     const uint32_t t = millis();
-
-    // ToF background read — same cadence as main loop
-    static uint32_t lastHomingTof = 0;
-    if (USE_TOF && (t - lastHomingTof >= TOF_POLL_MS)) {
-        lastHomingTof = t;
-        const ToFSensor::Reading r = tof.read();
-        if (r.valid) {
-            tofEma   = tofValid
-                     ? TOF_EMA_ALPHA * r.mm + (1.0f - TOF_EMA_ALPHA) * tofEma
-                     : static_cast<float>(r.mm);
-            tofMm    = static_cast<uint16_t>(roundf(tofEma));
-            tofValid = true;
-        }
-    }
-
-    // CAN STATUS_CONTROL broadcast — 50 Hz
     static uint32_t lastHomingTx = 0;
     if (t - lastHomingTx >= CAN_TX_CONTROL_INTERVAL_MS) {
         lastHomingTx = t;
@@ -524,14 +600,20 @@ static bool homePitch() {
         Serial.println(p1Fwd ? "[P1] seeking FWD limit..." : "[P1] seeking BWD limit...");
 
         uint32_t moved = 0;
+        pitch.setSpeed(PITCH_RAMP_START_SPD);  // start ramp from bottom
         while (!(p1Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())
                && moved < PITCH_HOME_MAX_STEPS) {
             if (USE_PITCH_FLT && pitch.faultActive()) { Serial.println("[P1] ABORT: driver fault"); break; }
             if (leak.isLeak() || inj_leak)            { Serial.println("[P1] ABORT: leak");         break; }
+            // Acceleration ramp only — no decel since limit switch position is unknown
+            if (PITCH_HOME_SPEED > PITCH_RAMP_START_SPD) {
+                const float spd = sqrtf(PITCH_RAMP_START_SPD*PITCH_RAMP_START_SPD + 2.0f*PITCH_RAMP_ACCEL*(float)moved);
+                pitch.setSpeed(min(PITCH_HOME_SPEED, spd));
+            }
             pitch.step();
             pitchSteps += p1Fwd ? 1 : -1;
             moved++;
-            tickHoming();
+            if ((moved & 15) == 0) tickHoming();
         }
         if (!(p1Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())) {
             Serial.print("[P1] FAILED after "); Serial.print(moved);
@@ -555,14 +637,20 @@ static bool homePitch() {
         Serial.println(p2Fwd ? "[P2] seeking FWD limit..." : "[P2] seeking BWD limit...");
 
         moved = 0;
+        pitch.setSpeed(PITCH_RAMP_START_SPD);  // restart ramp from bottom after driver reset
         while (!(p2Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())
                && moved < PITCH_HOME_MAX_STEPS) {
             if (USE_PITCH_FLT && pitch.faultActive()) { Serial.println("[P2] ABORT: driver fault"); break; }
             if (leak.isLeak() || inj_leak)            { Serial.println("[P2] ABORT: leak");         break; }
+            // Acceleration ramp only — no decel since limit switch position is unknown
+            if (PITCH_HOME_SPEED > PITCH_RAMP_START_SPD) {
+                const float spd = sqrtf(PITCH_RAMP_START_SPD*PITCH_RAMP_START_SPD + 2.0f*PITCH_RAMP_ACCEL*(float)moved);
+                pitch.setSpeed(min(PITCH_HOME_SPEED, spd));
+            }
             pitch.step();
             pitchSteps += p2Fwd ? 1 : -1;
             moved++;
-            tickHoming();
+            if ((moved & 15) == 0) tickHoming();
         }
         if (!(p2Fwd ? pitchFwdLimit.isPressed() : pitchRevLimit.isPressed())) {
             Serial.print("[P2] FAILED after "); Serial.print(moved);
@@ -899,80 +987,10 @@ static void executeSetpoint(float pitchMm, float rollDeg) {
 // ================================================================
 
 // Jog pitch by ±mm from current position. Uses pitchJogSpeed (runtime settable).
-// When USE_TOF: executes in 1mm chunks and reads ToF between each chunk.
-// If ToF doesn't move despite steps being sent → stall detected →
-//   pitchJogSpeed is reduced by TOF_STALL_SPEED_FACTOR and the move continues
-//   at the new (higher-torque) speed. Speed change persists so the next jog
-//   also benefits; user can reset with 'pspd'.
-static void jogPitch(float mm) {
-    if (mm == 0.0f) return;
-    if (!pitchHomed) Serial.println("[jog] WARN: pitch not homed — step counter unreliable");
-
-    const int32_t totalSteps = pitchMmToSteps(mm);
-    if (totalSteps == 0) return;
-
-    const int32_t sign      = (totalSteps > 0) ? 1 : -1;
-    const int32_t absTotal  = absI32(totalSteps);
-    // Chunk size = steps per 1mm — gives ToF enough travel to detect movement
-    const int32_t CHUNK     = pitchMmToSteps(1.0f);
-
-    // Snapshot ToF before jog for stall comparison
-    uint16_t tofChunkStart = tofMm;
-    uint8_t  stallCount    = 0;
-
-    pitch.setSpeed(pitchJogSpeed);
-
-    int32_t done = 0;
-    while (done < absTotal) {
-        const int32_t take = min(absTotal - done, CHUNK > 0 ? CHUNK : absTotal);
-        if (!movePitchDelta(sign * take)) break;
-        done += take;
-
-        // ToF stall check — only meaningful when sensor is fitted and valid
-        if (USE_TOF && tofValid && CHUNK > 0 && take == CHUNK) {
-            const ToFSensor::Reading r = tof.read();
-            if (r.valid) {
-                // Apply EMA to mid-jog read as well — keeps it consistent with background poll
-                tofEma = TOF_EMA_ALPHA * static_cast<float>(r.mm)
-                       + (1.0f - TOF_EMA_ALPHA) * tofEma;
-                tofMm = static_cast<uint16_t>(roundf(tofEma));
-
-                const uint16_t delta = (tofMm > tofChunkStart)
-                                     ? (tofMm - tofChunkStart)
-                                     : (tofChunkStart - tofMm);
-
-                if (delta < TOF_STALL_THRESHOLD_MM) {
-                    stallCount++;
-                    // Only act after TOF_STALL_CONFIRM consecutive stall chunks —
-                    // a single noisy reading won't trigger a speed reduction.
-                    if (stallCount >= TOF_STALL_CONFIRM && pitchJogSpeed > TOF_STALL_SPEED_MIN) {
-                        pitchJogSpeed = max(TOF_STALL_SPEED_MIN,
-                                           pitchJogSpeed * TOF_STALL_SPEED_FACTOR);
-                        pitch.setSpeed(pitchJogSpeed);
-                        Serial.print("[jog] stall confirmed ("); Serial.print(stallCount);
-                        Serial.print("x) — speed → "); Serial.print(pitchJogSpeed, 0);
-                        Serial.println(" steps/s");
-                    }
-                } else {
-                    stallCount = 0;  // movement seen — reset consecutive counter
-                }
-                tofChunkStart = tofMm;  // slide window
-            }
-        }
-    }
-
-    pitch.setSpeed(PITCH_RUN_SPEED);
-
-    Serial.print("[jog] pitch ");
-    Serial.print(mm > 0 ? "+" : ""); Serial.print(mm, 2); Serial.print(" mm");
-    if (USE_TOF && tofValid) {
-        Serial.print("  tof="); Serial.print(tofMm); Serial.print("mm");
-        if (stallCount) { Serial.print("  STALLS="); Serial.print(stallCount); }
-    }
-    if (pitchHomed) { Serial.print("  pos="); Serial.print(pitchStepsToMm(pitchSteps), 3); Serial.print("mm"); }
-    else            { Serial.print("  pos=UNKNOWN"); }
-    Serial.println();
-}
+// Single movePitchDelta call — the trapezoidal ramp handles smooth accel and
+// decel, ramping back down to PITCH_RAMP_START_SPD in the last ~1-2mm.
+// Real stall/OCP protection is inside movePitchDelta (fault pin + auto-retry).
+// ToF delta printed after move so you can verify actual vs commanded travel.
 
 // Jog roll by ±deg from current position. Uses rollJogSpeed (runtime settable).
 static void jogRoll(float deg) {
@@ -1235,8 +1253,8 @@ static void printHelp() {
     Serial.println("ap <mm>           -> pitch absolute position (mm, from centre)");
     Serial.println("ar <deg>          -> roll absolute angle (deg, from centre)");
     Serial.println("goto <mm> <deg>   -> pitch + roll absolute in one command");
-    Serial.println("pf <mm>           -> jog pitch forward N mm");
-    Serial.println("pb <mm>           -> jog pitch backward N mm");
+    Serial.println("f<mm>             -> pitch to absolute +mm from neutral  e.g. f10, f 10");
+    Serial.println("b<mm>             -> pitch to absolute -mm from neutral  e.g. b30, b 30");
     Serial.println("rcw <deg>         -> jog roll CW N degrees");
     Serial.println("rccw <deg>        -> jog roll CCW N degrees");
     Serial.println("pspd <steps/s>    -> set pitch jog speed (lower = more torque)");
@@ -1398,17 +1416,48 @@ static void handleCommand(String cmd) {
         return;
     }
 
-    // Jog commands
-    if (cmd.startsWith("pf ")) {
-        float mm = cmd.substring(3).toFloat();
-        if (mm <= 0.0f) { Serial.println("Usage: pf <mm>  e.g. pf 5.0"); return; }
-        jogPitch(mm);
+    // Absolute pitch position commands — f<mm> = forward from neutral, b<mm> = backward.
+    // e.g. "f10" or "f 10" → +10mm, "b30" or "b 30" → −30mm, "f0" → neutral.
+    if (cmd.startsWith("f") && cmd.length() > 1) {
+        if (!pitchHomed) { Serial.println("Not homed — run 'home' first"); return; }
+        const float target = cmd.substring(1).toFloat();
+        if (target < 0.0f || target > config::PITCH_MAX_MM) {
+            Serial.print("Out of range: f0 to f"); Serial.println(config::PITCH_MAX_MM, 1);
+            return;
+        }
+        const float currentMm = (USE_TOF && tofValid && pitchHomed)
+            ? ((float)TOF_NEUTRAL_MM - tofEma) : pitchStepsToMm(pitchSteps);
+        const float deltaMm = target - currentMm;
+        Serial.print("[pitch] abs target=+"); Serial.print(target, 2);
+        Serial.print("mm  current="); Serial.print(currentMm, 2); Serial.print("mm");
+        pitch.setSpeed(pitchJogSpeed);
+        const bool ok = movePitchDelta(pitchMmToSteps(deltaMm));
+        pitch.setSpeed(PITCH_RUN_SPEED);
+        Serial.print("  tof="); Serial.print(tofMm); Serial.print("mm");
+        Serial.print("  pos="); Serial.print(pitchStepsToMm(pitchSteps), 2); Serial.print("mm");
+        if (!ok) Serial.print("  [STOPPED EARLY]");
+        Serial.println();
         return;
     }
-    if (cmd.startsWith("pb ")) {
-        float mm = cmd.substring(3).toFloat();
-        if (mm <= 0.0f) { Serial.println("Usage: pb <mm>  e.g. pb 2.5"); return; }
-        jogPitch(-mm);
+    if (cmd.startsWith("b") && cmd.length() > 1) {
+        if (!pitchHomed) { Serial.println("Not homed — run 'home' first"); return; }
+        const float target = cmd.substring(1).toFloat();
+        if (target < 0.0f || target > config::PITCH_MAX_MM) {
+            Serial.print("Out of range: b0 to b"); Serial.println(config::PITCH_MAX_MM, 1);
+            return;
+        }
+        const float currentMm = (USE_TOF && tofValid && pitchHomed)
+            ? ((float)TOF_NEUTRAL_MM - tofEma) : pitchStepsToMm(pitchSteps);
+        const float deltaMm = -target - currentMm;
+        Serial.print("[pitch] abs target=-"); Serial.print(target, 2);
+        Serial.print("mm  current="); Serial.print(currentMm, 2); Serial.print("mm");
+        pitch.setSpeed(pitchJogSpeed);
+        const bool ok = movePitchDelta(pitchMmToSteps(deltaMm));
+        pitch.setSpeed(PITCH_RUN_SPEED);
+        Serial.print("  tof="); Serial.print(tofMm); Serial.print("mm");
+        Serial.print("  pos="); Serial.print(pitchStepsToMm(pitchSteps), 2); Serial.print("mm");
+        if (!ok) Serial.print("  [STOPPED EARLY]");
+        Serial.println();
         return;
     }
     if (cmd.startsWith("rcw ")) {
@@ -1429,7 +1478,7 @@ static void handleCommand(String cmd) {
     // Runtime jog speed adjustment (lower speed = more torque for stuck pitch)
     if (cmd.startsWith("pspd ")) {
         float spd = cmd.substring(5).toFloat();
-        if (spd < 400.0f || spd > 24000.0f) { Serial.println("pspd: valid range 400–24000 microsteps/s"); return; }
+        if (spd < 800.0f || spd > 24000.0f) { Serial.println("pspd: valid range 800–24000 microsteps/s"); return; }
         pitchJogSpeed = spd;
         Serial.print("Pitch jog speed set to "); Serial.print(spd, 0); Serial.println(" steps/s");
         return;
@@ -1816,10 +1865,20 @@ void loop() {
     }
 
     // ----------------------------------------------------------------
-    // Debug status print (2 s interval when 'debug t' is on)
-    // ----------------------------------------------------------------
-    if (debugPrint && now - lastPrint >= 2000) {
-        lastPrint = now;
-        printStatus();
+    // Adaptive background status print — always on.
+    // 1s when moving or expecting movement, 5s when fully idle.
+    {
+        const bool recentMove   = (now - lastPitchMoveMs < 3000) ||
+                                  (USE_ROLL && now - lastRollMoveMs < 3000);
+        const bool activeMode   = (mode == Mode::HOMING) ||
+                                  (mode == Mode::NEUTRAL) ||
+                                  newSetpointPending;
+        const uint32_t interval = (recentMove || activeMode) ? 1000 : 5000;
+        if (now - lastPrint >= interval) {
+            lastPrint = now;
+            printStatus();
+        }
     }
+
+    // debugPrint kept for CAN frame tracing — unrelated to status cadence
 }
