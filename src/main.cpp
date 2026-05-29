@@ -52,7 +52,7 @@ constexpr uint8_t  TOF_STALL_CONFIRM      = 2;
 // Auto torque: each confirmed stall reduces pitchJogSpeed by this fraction
 // 0.70 = −30% per stall event — aggressive drop gets to max torque faster
 constexpr float    TOF_STALL_SPEED_FACTOR = 0.70f;
-constexpr float    TOF_STALL_SPEED_MIN    = 25.0f;   // floor — full-step motor, can go this low safely
+constexpr float    TOF_STALL_SPEED_MIN    = 400.0f;  // floor — 1/16 microstep floor (was 25 × 16)
 // Jiggle recovery: when at min speed and still stalled, reverse this far then retry
 constexpr float    TOF_JIGGLE_MM          = 2.0f;    // mm to reverse per jiggle
 constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts before giving up
@@ -74,19 +74,25 @@ static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Dir
 // ----------------------------------------------------------------
 // Pitch runs slower than roll — lower speed stays in the high-torque
 // region of the stepper curve; going too slow causes DRV8825 OTP (overtemp).
-// 400 steps/s is the tested sweet spot for the current load.
-static constexpr float    PITCH_HOME_SPEED     = 300.0f;   // steps/s during homing
-static constexpr float    ROLL_HOME_SPEED      = 300.0f;   // steps/s during homing
-static constexpr float    PITCH_RUN_SPEED      = 400.0f;   // steps/s for CAN setpoint moves — stay in torque band
-static constexpr float    ROLL_RUN_SPEED       = 300.0f;   // steps/s for normal moves
-static constexpr uint32_t PITCH_HOME_MAX_STEPS = 30000;
+// Speeds are in microsteps/s (1/16 microstepping — M2 pin soldered HIGH on TB67S581FNG).
+// Physical mm/s is unchanged: PITCH_STEP_MM is now 0.000625mm so ×16 steps/s = same mm/s.
+// e.g. 6400 microsteps/s × 0.000625mm = 4.0 mm/s  (was 400 steps/s × 0.01mm = 4.0 mm/s ✓)
+static constexpr float    PITCH_HOME_SPEED     = 9600.0f;  // microsteps/s during homing  (6.0 mm/s @ 1/16)
+static constexpr float    ROLL_HOME_SPEED      = 400.0f;   // pps during homing (NFP-GW4632-25BY 337:1)
+static constexpr float    PITCH_RUN_SPEED      = 16000.0f; // microsteps/s for CAN setpoint moves (10.0 mm/s @ 1/16)
+static constexpr float    ROLL_RUN_SPEED       = 700.0f;   // pps for CAN setpoint moves (31.5°/s @ 337:1)
+static constexpr uint32_t PITCH_HOME_MAX_STEPS = 480000;   // same physical travel × 16 (was 30000)
+// Trapezoidal ramp — avoids resonance band on startup and prevents step loss on direction change.
+// min(accel_curve, decel_curve) approach: short moves automatically form a triangle profile.
+static constexpr float    PITCH_RAMP_START_SPD = 800.0f;   // microsteps/s — ramp entry/exit speed
+static constexpr float    PITCH_RAMP_ACCEL     = 32000.0f; // microsteps/s² — ramp in ~0.5mm
 static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 
 // Jog speeds — runtime adjustable via 'pspd' / 'rspd' commands.
 // Lower pitch jog speed = more torque (less back-EMF).
 // Default 300 steps/s gives good torque without OTP risk.
-static float pitchJogSpeed = 150.0f;   // conservative start — OCP risk at high speed under load
-static float rollJogSpeed  = 400.0f;
+static float pitchJogSpeed = 6400.0f;  // microsteps/s jog speed (4.0 mm/s @ 1/16)
+static float rollJogSpeed  = 500.0f;   // pps jog speed
 
 // ----------------------------------------------------------------
 // CAN
@@ -317,21 +323,30 @@ static bool movePitchDelta(int32_t delta) {
     uint8_t faultRetries = 0;
     constexpr uint8_t MAX_FAULT_RETRIES = 2;
 
+    // Trapezoidal ramp — avoids resonance at low speed and step loss at direction change.
+    // Speed = min(accel_curve, decel_curve), clamped to [RAMP_START, rampTarget].
+    // Short moves naturally form a triangle (no flat top) with no extra logic.
+    // On OCP retry: rampTarget is halved and the ramp restarts from RAMP_START.
+    float rampTarget = pitch.speed();
+    uint32_t stepsDone = 0;
+    pitch.setSpeed(min(PITCH_RAMP_START_SPD, rampTarget));
+
     while (remaining > 0) {
         if (USE_PITCH_FLT && pitch.faultActive()) {
             if (faultRetries < MAX_FAULT_RETRIES) {
                 faultRetries++;
-                // Halve speed before retry — lower back-EMF = lower peak coil current
-                const float newSpd = max(TOF_STALL_SPEED_MIN, pitch.speed() * 0.5f);
+                const float newSpd = max(TOF_STALL_SPEED_MIN, rampTarget * 0.5f);
                 Serial.print("[move] pitch OCP — auto-recover ");
                 Serial.print(faultRetries); Serial.print("/"); Serial.print(MAX_FAULT_RETRIES);
-                Serial.print("  spd "); Serial.print(pitch.speed(), 0);
+                Serial.print("  spd "); Serial.print(rampTarget, 0);
                 Serial.print("->"); Serial.print(newSpd, 0);
                 Serial.print("  remain="); Serial.print(remaining); Serial.println(" steps");
-                resetPitchDriver();                   // RST clears the latch
-                pitch.setSpeed(newSpd);
-                if (newSpd < pitchJogSpeed) pitchJogSpeed = newSpd;  // persist — next jog is safer too
-                delay(50);                            // brief settle before resuming
+                resetPitchDriver();
+                rampTarget = newSpd;
+                pitch.setSpeed(min(PITCH_RAMP_START_SPD, rampTarget));
+                if (newSpd < pitchJogSpeed) pitchJogSpeed = newSpd;
+                stepsDone = 0;  // restart ramp from bottom
+                delay(50);
                 continue;
             }
             Serial.println("[move] ABORT pitch: fault after retries — position lost, rehome required");
@@ -344,10 +359,21 @@ static bool movePitchDelta(int32_t delta) {
         }
         if (fwd  && pitchFwdLimit.isPressed()) { Serial.println("[move] STOP pitch: FWD limit hit"); return false; }
         if (!fwd && pitchRevLimit.isPressed()) { Serial.println("[move] STOP pitch: BWD limit hit"); return false; }
+
+        // Ramp speed update — Teensy M7 FPU makes sqrtf per-step cost negligible
+        if (rampTarget > PITCH_RAMP_START_SPD) {
+            const float v0       = PITCH_RAMP_START_SPD;
+            const float a        = PITCH_RAMP_ACCEL;
+            const float accelSpd = sqrtf(v0*v0 + 2.0f*a*(float)stepsDone);
+            const float decelSpd = sqrtf(v0*v0 + 2.0f*a*(float)remaining);
+            pitch.setSpeed(max(v0, min(rampTarget, min(accelSpd, decelSpd))));
+        }
+
         pitch.step();
         pitchSteps += fwd ? 1 : -1;
         lastPitchMoveMs = millis();
         remaining--;
+        stepsDone++;
     }
     return true;
 }
@@ -436,6 +462,8 @@ static uint8_t mapBmsStatus(uint16_t s) {
 // Pitch: two-end limit-switch homing, centre and zero.
 // Includes driver reset between phases (prevents OTP cascade fault).
 // Post-centering sanity check detects open-loop stall.
+static void sendStatusControl();  // forward declaration — defined later
+
 // Called inside blocking homing loops to keep CAN status fresh.
 // Polls ToF at its normal cadence and broadcasts STATUS_CONTROL so the Pi
 // can track position and ToF distance while homing is in progress.
@@ -574,6 +602,18 @@ static bool homePitch() {
         pitchSteps = 0;
         pitch.setDirection(PITCH_FORWARD_DIR);
 
+        // Report physical limit switch positions relative to centre — use this to tune PITCH_MAX_MM.
+        {
+            const float halfSpanMm = (span / 2) * config::PITCH_STEP_MM;
+            Serial.println("--------------------------------------------");
+            Serial.print("[P3] Physical FWD limit: +"); Serial.print(halfSpanMm, 2); Serial.println(" mm from centre");
+            Serial.print("[P3] Physical BWD limit: -"); Serial.print(halfSpanMm, 2); Serial.println(" mm from centre");
+            Serial.print("[P3] Software PITCH_MAX_MM = ±"); Serial.print(config::PITCH_MAX_MM, 1); Serial.println(" mm");
+            Serial.print("[P3] Using "); Serial.print((config::PITCH_MAX_MM / halfSpanMm) * 100.0f, 1);
+            Serial.println("% of physical range — increase PITCH_MAX_MM in constants.hpp to use more");
+            Serial.println("--------------------------------------------");
+        }
+
         // Sanity check: at claimed centre neither limit should be pressed.
         // If BWD is still pressed, the motor never left the end-stop — it
         // stalled silently during the centering move. This is the key guard
@@ -680,9 +720,9 @@ static bool homeRoll() {
         uint32_t moved = 0;
 
         // ----------------------------------------------------------
-        // R1: CCW until hall active — finds the -60 deg magnet
+        // R1: CCW until hall active — finds the -30 deg magnet
         // ----------------------------------------------------------
-        Serial.println("[R1] CCW seeking -60 deg magnet...");
+        Serial.println("[R1] CCW seeking -30 deg magnet...");
         roll.setDirection(opposite(ROLL_CW_DIR));
 
         while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
@@ -691,42 +731,42 @@ static bool homeRoll() {
             rollSteps--;
             moved++;
         }
-        if (!rollHall.isActive()) { Serial.println("[R1] FAILED: -60 magnet not found"); break; }
+        if (!rollHall.isActive()) { Serial.println("[R1] FAILED: -30 magnet not found"); break; }
         const int32_t limitCCW = rollSteps;
-        Serial.print("[R1] -60 magnet at step "); Serial.print(limitCCW);
+        Serial.print("[R1] -30 magnet at step "); Serial.print(limitCCW);
         Serial.print(" ("); Serial.print(limitCCW * config::ROLL_STEP_DEG, 1); Serial.println(" deg)");
 
         // ----------------------------------------------------------
-        // R2: CW — exit -60 magnet, sweep to +60 magnet
+        // R2: CW — exit -30 magnet, sweep to +30 magnet
         // ----------------------------------------------------------
-        Serial.println("[R2] CW — exiting -60, seeking +60...");
+        Serial.println("[R2] CW — exiting -30, seeking +30...");
         roll.setDirection(ROLL_CW_DIR);
         moved = 0;
 
-        // Exit the -60 magnet first
+        // Exit the -30 magnet first
         while (rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
             if (shouldAbortMove()) { Serial.println("[R2] ABORT: safety signal"); break; }
             roll.step();
             rollSteps++;
             moved++;
         }
-        if (rollHall.isActive()) { Serial.println("[R2] FAILED: could not exit -60 magnet"); break; }
-        Serial.println("[R2] Exited -60, continuing CW...");
+        if (rollHall.isActive()) { Serial.println("[R2] FAILED: could not exit -30 magnet"); break; }
+        Serial.println("[R2] Exited -30, continuing CW...");
 
-        // Sweep to +60 magnet
+        // Sweep to +30 magnet
         while (!rollHall.isActive() && moved < ROLL_HOME_MAX_STEPS) {
             if (shouldAbortMove()) { Serial.println("[R2] ABORT: safety signal"); break; }
             roll.step();
             rollSteps++;
             moved++;
         }
-        if (!rollHall.isActive()) { Serial.println("[R2] FAILED: +60 magnet not found"); break; }
+        if (!rollHall.isActive()) { Serial.println("[R2] FAILED: +30 magnet not found"); break; }
         const int32_t limitCW = rollSteps;
-        Serial.print("[R2] +60 magnet at step "); Serial.print(limitCW);
+        Serial.print("[R2] +30 magnet at step "); Serial.print(limitCW);
         Serial.print(" ("); Serial.print(limitCW * config::ROLL_STEP_DEG, 1); Serial.println(" deg)");
 
         const int32_t span = limitCW - limitCCW;
-        Serial.print("[R2] Span = "); Serial.print(span * config::ROLL_STEP_DEG, 1); Serial.println(" deg (expect ~120)");
+        Serial.print("[R2] Span = "); Serial.print(span * config::ROLL_STEP_DEG, 1); Serial.println(" deg (expect ~60)");
 
         // ----------------------------------------------------------
         // R3: move to midpoint between the two magnets and zero
@@ -1389,7 +1429,7 @@ static void handleCommand(String cmd) {
     // Runtime jog speed adjustment (lower speed = more torque for stuck pitch)
     if (cmd.startsWith("pspd ")) {
         float spd = cmd.substring(5).toFloat();
-        if (spd < 25.0f || spd > 500.0f) { Serial.println("pspd: valid range 25–500 steps/s"); return; }
+        if (spd < 400.0f || spd > 24000.0f) { Serial.println("pspd: valid range 400–24000 microsteps/s"); return; }
         pitchJogSpeed = spd;
         Serial.print("Pitch jog speed set to "); Serial.print(spd, 0); Serial.println(" steps/s");
         return;
