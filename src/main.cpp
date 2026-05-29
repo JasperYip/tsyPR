@@ -306,6 +306,8 @@ static void resetRollDriver() {
 // 'recover' + retry.  Up to MAX_FAULT_RETRIES retries; position counter is NOT
 // corrupted because the fault is detected before the failed step is taken.
 // Only if retries are exhausted does it abort and mark position as lost.
+static void sendStatusControl();  // forward declaration — defined later
+static void tickHoming();         // forward declaration — defined later
 static bool movePitchDelta(int32_t delta) {
     if (delta == 0) return true;
 
@@ -336,7 +338,7 @@ static bool movePitchDelta(int32_t delta) {
     // Periodic serial + ToF stall state — checked every 16 steps.
     // Serial progress only printed for moves > 5mm — suppresses noise from
     // short ToF correction steps and other small internal moves.
-    const bool printProgress = absI32(delta) > pitchMmToSteps(5.0f);
+    const bool printProgress = (int32_t)absI32(delta) > pitchMmToSteps(5.0f);
     uint32_t lastPrintMs  = millis();
     uint32_t lastTofMs    = millis();
     uint16_t prevTofRaw   = tofMm;
@@ -346,6 +348,9 @@ static bool movePitchDelta(int32_t delta) {
         // Every 16 steps: serial progress + ToF stall check
         if ((stepsDone & 15) == 0 && stepsDone > 0) {
             const uint32_t now = millis();
+
+            // CAN STATUS_CONTROL broadcast — keeps Pi updated during blocking move
+            tickHoming();
 
             // Serial progress — every 1s, only for moves > 5mm
             if (printProgress && (now - lastPrintMs >= 1000)) {
@@ -551,7 +556,6 @@ static uint8_t mapBmsStatus(uint16_t s) {
 // Pitch: two-end limit-switch homing, centre and zero.
 // Includes driver reset between phases (prevents OTP cascade fault).
 // Post-centering sanity check detects open-loop stall.
-static void sendStatusControl();  // forward declaration — defined later
 
 // Called inside blocking homing loops to keep CAN status fresh.
 // Polls ToF at its normal cadence and broadcasts STATUS_CONTROL so the Pi
