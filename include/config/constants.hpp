@@ -34,7 +34,7 @@ constexpr uint8_t NODE_ID_PR  = 3;
 constexpr float PITCH_STEP_MM = 0.000625f;  // 1/16 microstepping — full step (0.01mm) ÷ 16
 constexpr float ROLL_STEP_DEG = 0.045f;
 
-constexpr float PITCH_MAX_MM = 50.0f;
+constexpr float PITCH_MAX_MM = 52.0f;
 constexpr float ROLL_MAX_DEG = 30.0f;
 constexpr float PITCH_MIN_MM = -PITCH_MAX_MM;
 constexpr float ROLL_MIN_DEG = -ROLL_MAX_DEG;
