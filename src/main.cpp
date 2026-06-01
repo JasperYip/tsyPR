@@ -23,7 +23,7 @@
 // Hardware configuration
 // ----------------------------------------------------------------
 // Set false to run without BMS hardware connected.
-constexpr bool USE_BMS = false;
+constexpr bool USE_BMS = true;
 
 // Set false to mask the pitch driver FLT pin from safety faults.
 // RST-controlled startup now prevents boot-noise false faults — keep true.
