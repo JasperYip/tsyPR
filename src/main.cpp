@@ -1209,6 +1209,27 @@ static void handleCan() {
             return;
         }
 
+        // Fault clear — rising edge only, same pattern as homing.
+        // Resets the safety manager latch, resets the pitch driver, and returns
+        // to CAN mode so the Pi can resume commanding without a power cycle.
+        static bool lastFaultClearBit = false;
+        const bool faultClearBit    = (cmd.command_mode & can::CMD_FAULT_CLEAR) != 0;
+        const bool faultClearRising = faultClearBit && !lastFaultClearBit;
+        lastFaultClearBit = faultClearBit;
+
+        if (faultClearRising) {
+            Serial.println("CAN: fault clear requested");
+            safety.reset();
+            resetPitchDriver();
+            motorsEnabled   = true;
+            pitchIdleOff    = false;
+            rollIdleOff     = false;
+            lastSafety      = {};
+            if (mode != Mode::HOMING) mode = Mode::CAN;
+            Serial.println("CAN: faults cleared — resuming CAN mode");
+            return;
+        }
+
         // Pi reconnected after CAN timeout — resume CAN mode
         if (mode == Mode::NEUTRAL) {
             mode = Mode::CAN;

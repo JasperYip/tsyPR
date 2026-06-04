@@ -92,8 +92,9 @@ enum SoftFault : uint8_t
 
 enum CommandMode : uint8_t
 {
-    CMD_MOTOR_ENABLE = 1 << 0,
-    CMD_START_HOMING = 1 << 1
+    CMD_MOTOR_ENABLE  = 1 << 0,
+    CMD_START_HOMING  = 1 << 1,
+    CMD_FAULT_CLEAR   = 1 << 2   // clear latched faults and return to CAN mode
 };
 
 
