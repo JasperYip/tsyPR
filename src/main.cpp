@@ -78,9 +78,9 @@ static constexpr StepperDriver::Direction ROLL_CW_DIR       = StepperDriver::Dir
 // Physical mm/s is unchanged: PITCH_STEP_MM is now 0.000625mm so ×16 steps/s = same mm/s.
 // e.g. 6400 microsteps/s × 0.000625mm = 4.0 mm/s  (was 400 steps/s × 0.01mm = 4.0 mm/s ✓)
 static constexpr float    PITCH_HOME_SPEED     = 16000.0f; // microsteps/s during homing  (10.0 mm/s @ 1/16)
-static constexpr float    ROLL_HOME_SPEED      = 400.0f;   // pps during homing (NFP-GW4632-25BY 337:1)
+static constexpr float    ROLL_HOME_SPEED      = 200.0f;   // pps during homing  (9.0°/s @ 337:1)
 static constexpr float    PITCH_RUN_SPEED      = 16000.0f; // microsteps/s for CAN setpoint moves (10.0 mm/s @ 1/16)
-static constexpr float    ROLL_RUN_SPEED       = 700.0f;   // pps for CAN setpoint moves (31.5°/s @ 337:1)
+static constexpr float    ROLL_RUN_SPEED       = 300.0f;   // pps for CAN setpoint moves (13.5°/s @ 337:1)
 static constexpr uint32_t PITCH_HOME_MAX_STEPS = 480000;   // same physical travel × 16 (was 30000)
 // Trapezoidal ramp — avoids resonance band on startup and prevents step loss on direction change.
 // min(accel_curve, decel_curve) approach: short moves automatically form a triangle profile.
@@ -92,7 +92,7 @@ static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 // Lower pitch jog speed = more torque (less back-EMF).
 // Default 300 steps/s gives good torque without OTP risk.
 static float pitchJogSpeed = 9600.0f;  // microsteps/s jog speed (6.0 mm/s @ 1/16)
-static float rollJogSpeed  = 500.0f;   // pps jog speed
+static float rollJogSpeed  = 300.0f;   // pps jog speed (13.5°/s @ 337:1)
 
 // ----------------------------------------------------------------
 // CAN
