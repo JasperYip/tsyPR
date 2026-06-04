@@ -1220,7 +1220,10 @@ static void handleCan() {
         if (faultClearRising) {
             Serial.println("CAN: fault clear requested");
             safety.reset();
+            pitchHomingFailed = false;
+            rollHomingFailed  = false;
             resetPitchDriver();
+            resetRollDriver();
             motorsEnabled   = true;
             pitchIdleOff    = false;
             rollIdleOff     = false;
