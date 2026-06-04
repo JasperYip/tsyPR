@@ -61,7 +61,7 @@ constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts befo
 // homeRoll() will immediately return success so the Pi sees roll as homed.
 // All roll movement commands are silently skipped.
 // Useful when the roll motor is not physically wired.
-constexpr bool USE_ROLL = false;  // roll mechanism disabled — pitch-only testing
+constexpr bool USE_ROLL = true;
 
 // ----------------------------------------------------------------
 // Direction conventions — flip if a motor runs backwards
@@ -308,6 +308,7 @@ static void resetRollDriver() {
 // Only if retries are exhausted does it abort and mark position as lost.
 static void sendStatusControl();  // forward declaration — defined later
 static void tickHoming();         // forward declaration — defined later
+static void handleCan();          // forward declaration — defined later
 static bool movePitchDelta(int32_t delta) {
     if (delta == 0) return true;
 
@@ -334,11 +335,16 @@ static bool movePitchDelta(int32_t delta) {
     pitch.setSpeed(min(PITCH_RAMP_START_SPD, rampTarget));
 
     uint8_t jiggleCount = 0;
+    uint8_t tofStallRetries = 0;  // separate from faultRetries — OCP and ToF stall are independent
+    bool    retarget = false;     // set when a new CAN setpoint arrives mid-move
 
     // Periodic serial + ToF stall state — checked every 16 steps.
     // Serial progress only printed for moves > 5mm — suppresses noise from
     // short ToF correction steps and other small internal moves.
-    const bool printProgress = (int32_t)absI32(delta) > pitchMmToSteps(5.0f);
+    // ToF stall gated until motor has travelled 3mm — avoids false triggers
+    // during ramp-up where the motor moves <1mm per 100ms check interval.
+    const bool printProgress  = (int32_t)absI32(delta) > pitchMmToSteps(5.0f);
+    const uint32_t stallGate  = (uint32_t)pitchMmToSteps(3.0f);  // start checking after 3mm
     uint32_t lastPrintMs  = millis();
     uint32_t lastTofMs    = millis();
     uint16_t prevTofRaw   = tofMm;
@@ -349,8 +355,15 @@ static bool movePitchDelta(int32_t delta) {
         if ((stepsDone & 15) == 0 && stepsDone > 0) {
             const uint32_t now = millis();
 
-            // CAN STATUS_CONTROL broadcast — keeps Pi updated during blocking move
+            // Process incoming CAN — updates newSetpointPending if Pi sent a new target
+            handleCan();
             tickHoming();
+
+            // If a new setpoint arrived in CAN mode, break out so main loop
+            // can immediately execute the updated target instead of finishing here.
+            if (newSetpointPending && mode == Mode::CAN) {
+                retarget = true;
+            }
 
             // Serial progress — every 1s, only for moves > 5mm
             if (printProgress && (now - lastPrintMs >= 1000)) {
@@ -363,8 +376,10 @@ static bool movePitchDelta(int32_t delta) {
                 Serial.println("mm");
             }
 
-            // ToF stall check — every 100ms using raw reading
-            if (USE_TOF && tofValid && (now - lastTofMs >= 100)) {
+            // ToF stall check — every 500ms, only after 3mm of travel (past ramp-up).
+            // 500ms @ 10mm/s = 5mm expected movement — well above VL6180X 1mm noise floor.
+            // Three consecutive no-movement reads = 1.5s of confirmed zero ToF change = real stall.
+            if (USE_TOF && tofValid && stepsDone >= stallGate && (now - lastTofMs >= 500)) {
                 lastTofMs = now;
                 const ToFSensor::Reading r = tof.read();
                 if (r.valid) {
@@ -379,13 +394,12 @@ static bool movePitchDelta(int32_t delta) {
                     }
                     prevTofRaw = r.mm;
 
-                    // Two consecutive 100ms intervals with no ToF movement = stall
-                    if (tofStallCount >= 2 && faultRetries < MAX_FAULT_RETRIES && jiggleCount < TOF_JIGGLE_MAX) {
-                        faultRetries++;
+                    if (tofStallCount >= 3 && tofStallRetries < TOF_JIGGLE_MAX) {
+                        tofStallRetries++;
                         jiggleCount++;
                         tofStallCount = 0;
                         Serial.print("[move] ToF stall — jiggle ");
-                        Serial.print(jiggleCount); Serial.print("/"); Serial.print(TOF_JIGGLE_MAX);
+                        Serial.print(tofStallRetries); Serial.print("/"); Serial.print(TOF_JIGGLE_MAX);
                         Serial.print("  tof="); Serial.print(tofMm); Serial.println("mm");
                         resetPitchDriver();
                         const int32_t jiggleSteps = pitchMmToSteps(TOF_JIGGLE_MM);
@@ -395,10 +409,10 @@ static bool movePitchDelta(int32_t delta) {
                         pitchSteps += fwd ? -jiggleSteps : jiggleSteps;
                         remaining  += jiggleSteps;
                         pitch.setDirection(fwd ? PITCH_FORWARD_DIR : opposite(PITCH_FORWARD_DIR));
-                        const float newSpd = max(TOF_STALL_SPEED_MIN, rampTarget * 0.75f);
-                        rampTarget = newSpd;
+                        // No speed reduction — ToF stall is a mechanical engagement issue,
+                        // not a torque issue. Keep rampTarget unchanged.
                         pitch.setSpeed(min(PITCH_RAMP_START_SPD, rampTarget));
-                        stepsDone = 0;
+                        stepsDone = stallGate;  // restart past gate so stall check resumes quickly
                         delay(50);
                         prevTofRaw = tofMm;
                         lastTofMs  = millis();
@@ -407,6 +421,8 @@ static bool movePitchDelta(int32_t delta) {
                 }
             }
         }
+
+        if (retarget) break;  // new CAN setpoint received — exit and let main loop retarget
 
         if (USE_PITCH_FLT && pitch.faultActive()) {
             if (faultRetries < MAX_FAULT_RETRIES) {
@@ -454,13 +470,15 @@ static bool movePitchDelta(int32_t delta) {
         if (fwd  && pitchFwdLimit.isPressed()) { Serial.println("[move] STOP pitch: FWD limit hit"); return false; }
         if (!fwd && pitchRevLimit.isPressed()) { Serial.println("[move] STOP pitch: BWD limit hit"); return false; }
 
-        // Ramp speed update — Teensy M7 FPU makes sqrtf per-step cost negligible
+        // Ramp speed update — only call setSpeed when speed changes by >50 µsteps/s
+        // to avoid pointless register writes every step during cruise phase.
         if (rampTarget > PITCH_RAMP_START_SPD) {
             const float v0       = PITCH_RAMP_START_SPD;
             const float a        = PITCH_RAMP_ACCEL;
             const float accelSpd = sqrtf(v0*v0 + 2.0f*a*(float)stepsDone);
             const float decelSpd = sqrtf(v0*v0 + 2.0f*a*(float)remaining);
-            pitch.setSpeed(max(v0, min(rampTarget, min(accelSpd, decelSpd))));
+            const float newSpd   = max(v0, min(rampTarget, min(accelSpd, decelSpd)));
+            if (fabsf(newSpd - pitch.speed()) > 50.0f) pitch.setSpeed(newSpd);
         }
 
         pitch.step();
@@ -563,10 +581,14 @@ static uint8_t mapBmsStatus(uint16_t s) {
 // Called in the P1/P2 step loops every 16 steps — keeps CAN status fresh without
 // blocking I2C reads that would stutter the step timing. ToF value sent is the
 // last reading from before homing started; position (pitchSteps) is live.
+// CAN broadcast rate during blocking moves/homing — much lower than normal 50Hz
+// to avoid frequent SPI transfers that stutter step timing.
+static constexpr uint32_t TICK_MOVE_CAN_MS = 200;  // 5Hz during blocking moves
+
 static void tickHoming() {
     const uint32_t t = millis();
     static uint32_t lastHomingTx = 0;
-    if (t - lastHomingTx >= CAN_TX_CONTROL_INTERVAL_MS) {
+    if (t - lastHomingTx >= TICK_MOVE_CAN_MS) {
         lastHomingTx = t;
         sendStatusControl();
     }
@@ -983,7 +1005,9 @@ static void executeSetpoint(float pitchMm, float rollDeg) {
     // Closed-loop ToF correction — only when pitch move completed fully.
     // If a limit switch or fault stopped the move early, skip correction:
     // the motor is at a physical boundary and can't reach the target anyway.
-    if (pDelta != 0 && pitchCompleted) correctPitchWithToF(pClamped);
+    // Skip ToF correction if a new setpoint arrived mid-move — no point correcting
+    // to an old target we're about to leave anyway.
+    if (pDelta != 0 && pitchCompleted && !newSetpointPending) correctPitchWithToF(pClamped);
 }
 
 // ================================================================
