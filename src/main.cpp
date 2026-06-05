@@ -61,7 +61,7 @@ constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts befo
 // homeRoll() will immediately return success so the Pi sees roll as homed.
 // All roll movement commands are silently skipped.
 // Useful when the roll motor is not physically wired.
-constexpr bool USE_ROLL = false;
+constexpr bool USE_ROLL = true;   // hardware wired — Pi controls enable/disable via CMD_ROLL_ENABLE
 
 // ----------------------------------------------------------------
 // Direction conventions — flip if a motor runs backwards
