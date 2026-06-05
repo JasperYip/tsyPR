@@ -93,8 +93,10 @@ enum SoftFault : uint8_t
 enum CommandMode : uint8_t
 {
     CMD_MOTOR_ENABLE  = 1 << 0,
-    CMD_START_HOMING  = 1 << 1,
-    CMD_FAULT_CLEAR   = 1 << 2   // clear latched faults and return to CAN mode
+    CMD_HOME_PITCH    = 1 << 1,  // rising edge → home pitch axis only
+    CMD_FAULT_CLEAR   = 1 << 2,  // rising edge → clear faults, return to CAN
+    CMD_HOME_ROLL     = 1 << 3,  // rising edge → home roll axis only
+    CMD_ROLL_ENABLE   = 1 << 4   // level → 1=roll enabled, 0=roll disabled (persists)
 };
 
 

@@ -61,7 +61,7 @@ constexpr uint8_t  TOF_JIGGLE_MAX         = 3;       // max jiggle attempts befo
 // homeRoll() will immediately return success so the Pi sees roll as homed.
 // All roll movement commands are silently skipped.
 // Useful when the roll motor is not physically wired.
-constexpr bool USE_ROLL = true;
+constexpr bool USE_ROLL = false;
 
 // ----------------------------------------------------------------
 // Direction conventions — flip if a motor runs backwards
@@ -160,6 +160,12 @@ static bool    pitchHomed        = false;
 static bool    rollHomed         = false;
 static bool    pitchHomingFailed = false;
 static bool    rollHomingFailed  = false;
+// Runtime roll enable — updated by CMD_ROLL_ENABLE bit from Pi, persists between frames.
+// Overrides USE_ROLL without reflashing. Default off until Pi explicitly enables.
+static bool    rollEnabled       = false;
+// Which axes the current homing cycle should home — set in handleCan() before entering HOMING mode.
+static bool    homeReqPitch      = false;
+static bool    homeReqRoll       = false;
 static bool    motorsEnabled     = false;
 static uint32_t lastPitchMoveMs = 0;    // updated after every pitch step — drives pitch idle-disable
 static uint32_t lastRollMoveMs  = 0;    // updated after every roll step  — drives roll  idle-disable
@@ -230,6 +236,10 @@ static bool inj_home_fail_r = false;
 // Helpers
 // ================================================================
 
+// Runtime roll gate — hardware init uses USE_ROLL alone; all operational
+// checks use rollActive() so the Pi can toggle roll without reflashing.
+static inline bool rollActive() { return USE_ROLL && rollEnabled; }
+
 static StepperDriver::Direction opposite(StepperDriver::Direction d) {
     return d == StepperDriver::Direction::CW
         ? StepperDriver::Direction::CCW
@@ -252,7 +262,7 @@ static void wakeDrivers() {
     const uint32_t now = millis();
     if (AUTO_DISABLE_IDLE) {
         if (pitchIdleOff) { pitch.enable(); pitchIdleOff = false; delay(10); }
-        if (USE_ROLL && rollIdleOff) { roll.enable(); rollIdleOff = false; delay(10); }
+        if (rollActive() && rollIdleOff) { roll.enable(); rollIdleOff = false; delay(10); }
     }
     lastPitchMoveMs = now;
     lastRollMoveMs  = now;
@@ -262,7 +272,7 @@ static void wakeDrivers() {
 static bool shouldAbortMove() {
     return (leak.isLeak() || inj_leak)
         || (USE_PITCH_FLT && pitch.faultActive())
-        || (USE_ROLL && roll.faultActive());
+        || (rollActive() && roll.faultActive());
 }
 
 // ----------------------------------------------------------------
@@ -492,7 +502,7 @@ static bool movePitchDelta(int32_t delta) {
 
 // Move roll by |delta| steps; checks abort signals every step.
 static bool moveRollDelta(int32_t delta) {
-    if (!USE_ROLL) return true;  // roll bypassed — silently succeed
+    if (!rollActive()) return true;  // roll bypassed — silently succeed
     if (delta == 0) return true;
 
     // Wake driver if idle-disabled
@@ -504,11 +514,22 @@ static bool moveRollDelta(int32_t delta) {
     const bool cw = delta > 0;
     const uint32_t n = absI32(delta);
     roll.setDirection(cw ? ROLL_CW_DIR : opposite(ROLL_CW_DIR));
+
     for (uint32_t i = 0; i < n; i++) {
         if (shouldAbortMove()) {
             Serial.println("[move] ABORT roll: safety signal");
             return false;
         }
+
+        // Every 16 steps: CAN status broadcast + check for new setpoint
+        if ((i & 15) == 0 && i > 0) {
+            handleCan();
+            tickHoming();
+            if (newSetpointPending && mode == Mode::CAN) {
+                break;  // retarget — main loop will execute updated setpoint
+            }
+        }
+
         roll.step();
         rollSteps += cw ? 1 : -1;
         lastRollMoveMs = millis();
@@ -813,12 +834,12 @@ static bool homePitch() {
 
 // Roll: dual-magnet hall sensor homing, centres between ±60° magnets.
 static bool homeRoll() {
-    if (!USE_ROLL) {
-        // Roll axis not physically wired — fake success so Pi sees roll as homed.
+    if (!rollActive()) {
+        // Roll axis disabled (USE_ROLL=false or rollEnabled=false) — report as homed.
         rollHomed        = true;
         rollHomingFailed = false;
         rollSteps        = 0;
-        Serial.println(">>> ROLL HOMING BYPASSED (USE_ROLL=false) — reported as homed");
+        Serial.println(">>> ROLL HOMING BYPASSED (roll disabled) — reported as homed");
         return true;
     }
     Serial.println();
@@ -911,12 +932,17 @@ static bool homeRoll() {
     return ok;
 }
 
-// Run both sequences sequentially; called from loop dispatch while mode == HOMING.
+// Home the axes requested by homeReqPitch / homeReqRoll.
+// Called from loop dispatch while mode == HOMING.
 static void runHoming() {
-    const bool p = homePitch();
-    const bool r = homeRoll();
-    Serial.print("Homing complete: pitch="); Serial.print(p ? "OK" : "FAIL");
-    Serial.print("  roll="); Serial.println(r ? "OK" : "FAIL");
+    const bool p = homeReqPitch ? homePitch() : pitchHomed;  // skip if not requested
+    const bool r = homeReqRoll  ? homeRoll()  : rollHomed;
+
+    Serial.print("Homing complete:");
+    if (homeReqPitch) { Serial.print(" pitch="); Serial.print(p ? "OK" : "FAIL"); }
+    if (homeReqRoll)  { Serial.print(" roll=");  Serial.print(r ? "OK" : "FAIL"); }
+    Serial.println();
+
     if (p && r) { targetPitchMm = 0.0f; targetRollDeg = 0.0f; }
     mode = homingReturnMode;
 
@@ -930,7 +956,7 @@ static void runHoming() {
     // motors whine until the next main-loop iteration fires the 1s timer.
     if (AUTO_DISABLE_IDLE) {
         pitch.disable();  pitchIdleOff = true;
-        if (USE_ROLL) { roll.disable(); rollIdleOff = true; }
+        if (rollActive()) { roll.disable(); rollIdleOff = true; }
     }
 }
 
@@ -1065,7 +1091,7 @@ static void sendStatusControl() {
     if (pitchHomed)                           fa |= can::FLAG_HOMED_P;
     if (rollHomed)                            fa |= can::FLAG_HOMED_R;
     if (motorsEnabled && !pitchIdleOff)       fa |= can::FLAG_ENABLE_P;
-    if (USE_ROLL && motorsEnabled && !rollIdleOff) fa |= can::FLAG_ENABLE_R;
+    if (rollActive() && motorsEnabled && !rollIdleOff) fa |= can::FLAG_ENABLE_R;
     msg.flagsA = fa;
 
     uint8_t fb = 0;
@@ -1194,18 +1220,29 @@ static void handleCan() {
         can::CmdSetpoint cmd;
         can::unpackCmdSetpoint(frame.data, cmd);
 
-        // Homing command — trigger on rising edge only (0→1 transition).
-        // Pi may hold CMD_START_HOMING high for multiple frames; without edge
-        // detection homing would re-trigger immediately after completing.
-        static bool lastHomingBit = false;
-        const bool homingBit = (cmd.command_mode & can::CMD_START_HOMING) != 0;
-        const bool homingRising = homingBit && !lastHomingBit;
-        lastHomingBit = homingBit;
+        // Roll enable — level-sensitive, persists between frames.
+        rollEnabled = (cmd.command_mode & can::CMD_ROLL_ENABLE) != 0;
 
-        if (homingRising && mode != Mode::HOMING) {
+        // Independent homing triggers — rising edge per axis.
+        // Pi can home pitch-only, roll-only, or both simultaneously.
+        static bool lastHomePitchBit = false;
+        static bool lastHomeRollBit  = false;
+        const bool homePitchBit    = (cmd.command_mode & can::CMD_HOME_PITCH) != 0;
+        const bool homeRollBit     = (cmd.command_mode & can::CMD_HOME_ROLL)  != 0;
+        const bool homePitchRising = homePitchBit && !lastHomePitchBit;
+        const bool homeRollRising  = homeRollBit  && !lastHomeRollBit;
+        lastHomePitchBit = homePitchBit;
+        lastHomeRollBit  = homeRollBit;
+
+        if ((homePitchRising || homeRollRising) && mode != Mode::HOMING) {
+            homeReqPitch     = homePitchRising;
+            homeReqRoll      = homeRollRising && rollEnabled;
             homingReturnMode = Mode::CAN;
-            mode = Mode::HOMING;
-            Serial.println("CAN: homing triggered");
+            mode             = Mode::HOMING;
+            Serial.print("CAN: homing triggered —");
+            if (homeReqPitch) Serial.print(" PITCH");
+            if (homeReqRoll)  Serial.print(" ROLL");
+            Serial.println();
             return;
         }
 
@@ -1328,7 +1365,7 @@ static void printStatus() {
     Serial.print(" BMS=");   Serial.print(USE_BMS ? "EN" : "DIS");
     Serial.print("]  mode="); Serial.print(modeName(mode));
     Serial.print("  pitch_drv="); Serial.print(!motorsEnabled ? "DIS" : pitchIdleOff ? "IDLE-OFF" : "EN");
-    Serial.print("  roll_drv=");  Serial.print(!USE_ROLL ? "BYPASSED" : !motorsEnabled ? "DIS" : rollIdleOff ? "IDLE-OFF" : "EN");
+    Serial.print("  roll_drv=");  Serial.print(!rollActive() ? "BYPASSED" : !motorsEnabled ? "DIS" : rollIdleOff ? "IDLE-OFF" : "EN");
     Serial.print("  homed_P="); Serial.print(pitchHomed ? "Y" : "N");
     Serial.print("  homed_R="); Serial.println(rollHomed ? "Y" : "N");
 
@@ -1341,8 +1378,8 @@ static void printStatus() {
     Serial.print("  flt_P=");   Serial.println(pitch.faultActive() ? "FAULT" : "ok");
 
     Serial.print("  roll=");
-    if (!USE_ROLL) {
-        Serial.println("BYPASSED (USE_ROLL=false)");
+    if (!rollActive()) {
+        Serial.print("BYPASSED ("); Serial.print(!USE_ROLL ? "USE_ROLL=false" : "Pi disabled"); Serial.println(")");
     } else {
         if (rollHomed) { Serial.print(rollStepsToDeg(rollSteps), 3); Serial.print("deg"); }
         else Serial.print("UNKNOWN");
@@ -1399,7 +1436,7 @@ static void handleCommand(String cmd) {
     if (cmd == "en") {
         if (lastSafety.hard_fault) { Serial.println("Hard fault active — run 'recover' first"); return; }
         pitch.enable();
-        if (USE_ROLL) roll.enable();
+        if (rollActive()) roll.enable();
         motorsEnabled = true;
         pitchIdleOff = false;
         rollIdleOff  = false;
@@ -1410,7 +1447,7 @@ static void handleCommand(String cmd) {
     }
     if (cmd == "dis") {
         pitch.disable();
-        if (USE_ROLL) roll.disable();
+        if (rollActive()) roll.disable();
         motorsEnabled = false;
         pitchIdleOff = false;
         rollIdleOff  = false;
@@ -1513,14 +1550,14 @@ static void handleCommand(String cmd) {
         return;
     }
     if (cmd.startsWith("rcw ")) {
-        if (!USE_ROLL) { Serial.println("Roll bypassed (USE_ROLL=false)"); return; }
+        if (!rollActive()) { Serial.println("Roll bypassed (disabled)"); return; }
         float deg = cmd.substring(4).toFloat();
         if (deg <= 0.0f) { Serial.println("Usage: rcw <deg>  e.g. rcw 30"); return; }
         jogRoll(deg);
         return;
     }
     if (cmd.startsWith("rccw ")) {
-        if (!USE_ROLL) { Serial.println("Roll bypassed (USE_ROLL=false)"); return; }
+        if (!rollActive()) { Serial.println("Roll bypassed (disabled)"); return; }
         float deg = cmd.substring(5).toFloat();
         if (deg <= 0.0f) { Serial.println("Usage: rccw <deg>  e.g. rccw 15"); return; }
         jogRoll(-deg);
@@ -1670,12 +1707,12 @@ void setup() {
     // wakeDrivers() will enable automatically before the first move.
     if (AUTO_DISABLE_IDLE) {
         pitch.disable();
-        if (USE_ROLL) roll.disable();
+        if (USE_ROLL) roll.disable();  // disable hardware regardless of rollEnabled
         pitchIdleOff = true;
-        rollIdleOff  = USE_ROLL;
+        rollIdleOff  = USE_ROLL;       // mark as idle-off so wakeDrivers() enables on demand
     } else {
         pitch.enable();
-        if (USE_ROLL) roll.enable();
+        if (rollActive()) roll.enable();
         pitchIdleOff = false;
         rollIdleOff  = false;
     }
@@ -1714,7 +1751,7 @@ void setup() {
     Serial.print(CAN_NODE_ID);
     Serial.print("  BMS="); Serial.print(USE_BMS ? "EN" : "DIS");
     Serial.println("]");
-    Serial.println("CAN mode active. Pi sends CMD_START_HOMING to begin.");
+    Serial.println("CAN mode active. Pi sends CMD_HOME_PITCH / CMD_HOME_ROLL to home axes.");
     Serial.println("Type 'auto' for serial control, 'debug t' for live status, 'help' for commands.");
     Serial.println();
 }
@@ -1829,7 +1866,7 @@ void loop() {
         // debounce (500 ms) prevents transient glitches from latching a fault.
         const bool fltGrace = (now2 < 10000);  // 10s grace — covers Pi CAN initialisation
         sin.driver_fault_pitch_raw = (USE_PITCH_FLT && !fltGrace && pitch.faultActive()) || inj_driver_p;
-        sin.driver_fault_roll_raw  = (!fltGrace && USE_ROLL && roll.faultActive()) || inj_driver_r;
+        sin.driver_fault_roll_raw  = (!fltGrace && rollActive() && roll.faultActive()) || inj_driver_r;
         sin.homing_failed_pitch    = pitchHomingFailed   || inj_home_fail_p;
         sin.homing_failed_roll     = rollHomingFailed    || inj_home_fail_r;
         sin.stall_pitch_raw        = false;  // no current sensing on steppers
@@ -1861,14 +1898,14 @@ void loop() {
         if (lastSafety.hard_fault && !suppress) {
             if (motorsEnabled) {
                 pitch.disable();
-                if (USE_ROLL) roll.disable();
+                if (rollActive()) roll.disable();
                 motorsEnabled = false;
                 pitchIdleOff = false;  // fault disable takes precedence
                 rollIdleOff  = false;
             }
         } else if (!motorsEnabled) {
             pitch.enable();
-            if (USE_ROLL) roll.enable();
+            if (rollActive()) roll.enable();
             pitchIdleOff = false;
             rollIdleOff  = false;
             lastPitchMoveMs = millis();
@@ -1888,7 +1925,7 @@ void loop() {
             pitch.disable();
             pitchIdleOff = true;
         }
-        if (USE_ROLL && !rollIdleOff && (now3 - lastRollMoveMs > IDLE_DISABLE_MS)) {
+        if (rollActive() && !rollIdleOff && (now3 - lastRollMoveMs > IDLE_DISABLE_MS)) {
             roll.disable();
             rollIdleOff = true;
         }
@@ -1921,7 +1958,7 @@ void loop() {
     // 1s when moving or expecting movement, 5s when fully idle.
     {
         const bool recentMove   = (now - lastPitchMoveMs < 3000) ||
-                                  (USE_ROLL && now - lastRollMoveMs < 3000);
+                                  (rollActive() && now - lastRollMoveMs < 3000);
         const bool activeMode   = (mode == Mode::HOMING) ||
                                   (mode == Mode::NEUTRAL) ||
                                   newSetpointPending;
