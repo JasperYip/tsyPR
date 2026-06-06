@@ -89,9 +89,8 @@ static constexpr float    PITCH_RAMP_ACCEL     = 32000.0f; // microsteps/s² —
 static constexpr uint32_t ROLL_HOME_MAX_STEPS  = 15000;
 
 // Jog speeds — runtime adjustable via 'pspd' / 'rspd' commands.
-// Lower pitch jog speed = more torque (less back-EMF).
-// Default 300 steps/s gives good torque without OTP risk.
-static float pitchJogSpeed = 9600.0f;  // microsteps/s jog speed (6.0 mm/s @ 1/16)
+// Matched to PITCH_HOME_SPEED so f/b serial jog feels identical to homing moves.
+static float pitchJogSpeed = 16000.0f;  // microsteps/s jog speed (10.0 mm/s @ 1/16)
 static float rollJogSpeed  = 300.0f;   // pps jog speed (13.5°/s @ 337:1)
 
 // ----------------------------------------------------------------
@@ -319,7 +318,7 @@ static void resetRollDriver() {
 static void sendStatusControl();  // forward declaration — defined later
 static void tickHoming();         // forward declaration — defined later
 static void handleCan();          // forward declaration — defined later
-static bool movePitchDelta(int32_t delta) {
+static bool movePitchDelta(int32_t delta, bool accelOnly = true) {
     if (delta == 0) return true;
 
     // Wake driver if idle-disabled — give it a few ms to stabilise before stepping
@@ -482,12 +481,17 @@ static bool movePitchDelta(int32_t delta) {
 
         // Ramp speed update — only call setSpeed when speed changes by >50 µsteps/s
         // to avoid pointless register writes every step during cruise phase.
+        // accelOnly=true: no decel phase — motor runs at full rampTarget until stop.
+        // Used for P3 centering so the ramp shape matches P1/P2 (accel-only) and
+        // avoids the resonance band re-entry that occurs during deceleration.
+        // P4 ToF correction handles any positional overshoot.
         if (rampTarget > PITCH_RAMP_START_SPD) {
             const float v0       = PITCH_RAMP_START_SPD;
             const float a        = PITCH_RAMP_ACCEL;
             const float accelSpd = sqrtf(v0*v0 + 2.0f*a*(float)stepsDone);
-            const float decelSpd = sqrtf(v0*v0 + 2.0f*a*(float)remaining);
-            const float newSpd   = max(v0, min(rampTarget, min(accelSpd, decelSpd)));
+            const float newSpd   = accelOnly
+                ? max(v0, min(rampTarget, accelSpd))
+                : max(v0, min(rampTarget, min(accelSpd, sqrtf(v0*v0 + 2.0f*a*(float)remaining))));
             if (fabsf(newSpd - pitch.speed()) > 50.0f) pitch.setSpeed(newSpd);
         }
 
@@ -729,7 +733,7 @@ static bool homePitch() {
         const int32_t delta  = center - pitchSteps;
         Serial.print("[P3] moving to centre step "); Serial.println(center);
 
-        if (!movePitchDelta(delta)) {
+        if (!movePitchDelta(delta, true)) {  // accelOnly — matches P1/P2 ramp, avoids decel resonance
             Serial.println("[P3] ABORT: could not reach centre");
             break;
         }
